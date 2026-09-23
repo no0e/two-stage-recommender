@@ -29,10 +29,11 @@ SEQUENTIAL = ["#9ec5f4", "#6da7ec", "#3987e5", "#2a78d6", "#256abf", "#1c5cab"]
 LABELS = {
     "popularity": "Most popular",
     "bert4rec": "BERT4Rec alone",
-    "two_stage": "Two-stage",
     "lightgcn": "LightGCN alone",
+    "ease": "Recency EASE",
+    "two_stage": "Two-stage",
 }
-ORDER = ["popularity", "bert4rec", "two_stage", "lightgcn"]
+ORDER = ["popularity", "bert4rec", "lightgcn", "ease", "two_stage"]
 
 
 def apply_style():
@@ -70,7 +71,7 @@ def _strip(ax, keep=("left", "bottom")):
 def panel_recall(ax, results, k):
     """Recall@k for each system. Bars from zero, so lengths are comparable."""
     values = [results[name][f"recall@{k}"] for name in ORDER]
-    colours = [BASELINE] + list(SEQUENTIAL[1:4])
+    colours = [BASELINE] + list(SEQUENTIAL[1:5])
     y = np.arange(len(ORDER))
 
     ax.barh(y, values, height=0.6, color=colours, zorder=2)
@@ -82,8 +83,8 @@ def panel_recall(ax, results, k):
     ax.set_yticks(y)
     ax.set_yticklabels([LABELS[name] for name in ORDER])
     ax.set_xlim(0, max(values) * 1.3)
-    ax.set_xlabel(f"Recall@{k}, 940 held-out users")
-    ax.set_title("Retrieval alone is the best single system")
+    ax.set_xlabel(f"Recall@{k}, 943 held-out users")
+    ax.set_title("Each stage earns its place")
     ax.grid(axis="y", visible=False)
     _strip(ax)
 
@@ -94,7 +95,7 @@ def panel_intervals(ax, comparisons, k):
     The interval is what makes the panel worth drawing: three differences that
     all look like wins are only wins if their intervals clear zero.
     """
-    names = ["bert4rec", "two_stage", "lightgcn"]
+    names = ["bert4rec", "lightgcn", "ease", "two_stage"]
     y = np.arange(len(names))
 
     ax.axvline(0, color=BASELINE, linewidth=1.2, linestyle=(0, (3, 3)),
@@ -114,31 +115,42 @@ def panel_intervals(ax, comparisons, k):
     ax.set_yticklabels([LABELS[name] for name in names])
     ax.set_ylim(-0.6, len(names) - 0.25)
     ax.set_xlabel(f"Recall@{k} above the popularity baseline")
-    ax.set_title("All three clear zero, 2000 paired resamples")
+    ax.set_title("All four clear zero, 2000 paired resamples")
     ax.grid(axis="y", visible=False)
     _strip(ax)
 
 
-def panel_alpha(ax, sweep, k):
-    """The retrieval blend sweep: how much the content half is worth."""
-    alphas = sorted(float(a) for a in sweep)
-    values = [sweep[str(a)] if str(a) in sweep else sweep[f"{a}"]
-              for a in alphas]
+def panel_beta(ax, sweep, k):
+    """How much of the final order the reranker should set.
 
-    ax.plot(alphas, values, color=SERIES_1, linewidth=2, zorder=3)
-    ax.scatter(alphas, values, s=40, color=SERIES_1, zorder=4,
+    The panel with a finding in it. At beta = 1 the sequence model reorders the
+    candidates on its own opinion and the retrieval score is discarded, which
+    is what the competition version did; it is the worst point on the curve,
+    below even leaving the retrieval order untouched.
+    """
+    betas = sorted(float(b) for b in sweep)
+    values = [sweep[str(b)] for b in betas]
+
+    ax.plot(betas, values, color=SERIES_1, linewidth=2, zorder=3)
+    ax.scatter(betas, values, s=40, color=SERIES_1, zorder=4,
                edgecolor=SURFACE, linewidth=1.6)
-    for alpha, value in zip(alphas, values):
-        if alpha in (0.0, 1.0):
-            ax.annotate(f"{value:.2f}", (alpha, value),
-                        textcoords="offset points", xytext=(0, 11),
-                        ha="center", fontsize=8.5, color=INK,
-                        fontweight="bold")
 
-    ax.set_xticks(alphas)
-    ax.set_xlabel("alpha: 0 is content only, 1 is the graph only")
-    ax.set_ylabel("Target inside the candidate set")
-    ax.set_title("Content adds nothing to retrieval here")
+    best = max(range(len(betas)), key=lambda i: values[i])
+    for i in (0, best, len(betas) - 1):
+        ax.annotate(f"{values[i]:.3f}", (betas[i], values[i]),
+                    textcoords="offset points", xytext=(0, 11), ha="center",
+                    fontsize=8.5, color=INK, fontweight="bold")
+    ax.annotate("retrieval order untouched", (betas[0], values[0]),
+                textcoords="offset points", xytext=(6, -26), fontsize=7.5,
+                color=INK_MUTED)
+    ax.annotate("reranker alone, as first written",
+                (betas[-1], values[-1]), textcoords="offset points",
+                xytext=(-8, 16), ha="right", fontsize=7.5, color=INK_MUTED)
+
+    ax.set_xticks(betas)
+    ax.set_xlabel("beta: how much of the order the reranker sets")
+    ax.set_ylabel(f"Recall@{k} on validation")
+    ax.set_title("Reranking helps only if it keeps the retrieval score")
     ax.grid(axis="x", visible=False)
     _strip(ax)
 
@@ -150,22 +162,28 @@ def panel_coverage(ax, results, k):
     respectably on recall. Plotting the share of the catalogue it reaches is
     what makes that visible.
     """
+    # Two-stage and EASE sit almost on top of each other, so the labels
+    # alternate above and below rather than collide.
+    offsets = {"popularity": (0, 14, "center"), "bert4rec": (0, 14, "center"),
+               "lightgcn": (-10, -6, "right"), "ease": (0, -20, "center"),
+               "two_stage": (0, 14, "center")}
     for name in ORDER:
         x = results[name]["catalogue_coverage"]
         y = results[name][f"recall@{k}"]
         colour = BASELINE if name == "popularity" else SERIES_1
         ax.scatter([x], [y], s=110, color=colour, zorder=3,
                    edgecolor=SURFACE, linewidth=2)
+        dx, dy, align = offsets.get(name, (0, 14, "center"))
         ax.annotate(LABELS[name], (x, y), textcoords="offset points",
-                    xytext=(0, 13), ha="center", fontsize=8.5,
+                    xytext=(dx, dy), ha=align, fontsize=8.5,
                     color=INK_SECONDARY)
 
     ax.set_xlim(0, 0.78)
-    ax.set_ylim(0, max(results[n][f"recall@{k}"] for n in ORDER) * 1.35)
+    ax.set_ylim(-0.012, max(results[n][f"recall@{k}"] for n in ORDER) * 1.4)
     ax.xaxis.set_major_formatter(lambda v, _: f"{v:.0%}")
     ax.set_xlabel("Share of the catalogue ever recommended")
     ax.set_ylabel(f"Recall@{k}")
-    ax.set_title("Popularity reaches 4% of the catalogue")
+    ax.set_title("Popularity reaches 5% of the catalogue")
     _strip(ax)
 
 
@@ -176,7 +194,7 @@ def results_figure(summary, path):
 
     panel_recall(axes[0, 0], summary["results"], k)
     panel_intervals(axes[0, 1], summary["comparisons"], k)
-    panel_alpha(axes[1, 0], summary["alpha_sweep"], k)
+    panel_beta(axes[1, 0], summary["beta_sweep"], k)
     panel_coverage(axes[1, 1], summary["results"], k)
 
     figure.suptitle(
@@ -186,7 +204,8 @@ def results_figure(summary, path):
     figure.text(
         0.012, 0.945,
         "MovieLens 100k, leave-one-out: the last item of each user is the "
-        "target and everything before it trains. 940 users, 1,682 items.",
+        "target and everything before it trains. 943 users, 1,682 items. "
+        "Every weight fitted on a split one step further back.",
         fontsize=8.5, color=INK_MUTED, ha="left",
     )
     figure.tight_layout(rect=[0, 0, 1, 0.925])
