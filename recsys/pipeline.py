@@ -109,9 +109,9 @@ class TwoStageRecommender(Recommender):
         self.cold = cold
         self.alpha = alpha
         # How much of the final order the sequence model gets to set. At 1 it
-        # reranks on its own opinion and the retrieval score is thrown away,
-        # which is what the first version did and why it scored below plain
-        # retrieval: the reranker is meant to refine an order, not replace it.
+        # reranks on its own opinion and the retrieval score is discarded,
+        # which measures below leaving the retrieval order untouched: the
+        # second stage is there to refine an order, not to replace it.
         self.beta = beta
         self.n_candidates = n_candidates
         self.max_length = max_length

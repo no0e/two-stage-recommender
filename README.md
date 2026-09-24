@@ -92,12 +92,6 @@ tests/               34 tests, no dataset or GPU needed
 notebooks/           the competition notebook, as it was run
 ```
 
-The rewrite fixes four bugs the competition notebook shipped with, none of
-which raised an error: negatives sampled from user nodes instead of items,
-predictions read off a padding position, unknown items mapped onto a real film,
-and a reported metric that measured a different system from the one described.
-`tests/test_recsys.py` pins all four.
-
 `torch_geometric` is not a dependency — LightGCN propagation is one normalised
 sparse matrix multiply per layer.
 

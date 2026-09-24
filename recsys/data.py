@@ -6,9 +6,9 @@ shape: interactions with a timestamp, and items with a title and categories to
 build content features from.
 
 One decision here is load-bearing. Index 0 is reserved as padding and never
-belongs to an item. The original version mapped unknown items to index 0 with
-`item_id_to_idx.get(item_id, 0)`, which silently rewrote every unseen item into
-whichever real item happened to sort first, and then trained on it.
+belongs to an item, so items are numbered from 1. Mapping an unknown item to 0
+is then safe: it lands on a slot that is masked in the sequence model and
+excluded from every ranking, rather than on whichever real item sorts first.
 """
 from pathlib import Path
 

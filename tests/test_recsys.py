@@ -1,9 +1,11 @@
 """The whole test suite.
 
-Most of it is about the four bugs the competition notebook shipped with. None
-of them raised an error: each returned a plausible number for a question nobody
-asked, which is how they survived to the end of the competition. The rest cover
-the closed-form model's recency weighting and the two stages joined up.
+Most of it pins the things that go wrong without raising anything: which index
+means padding, which side a sequence is padded on, where item nodes sit in the
+graph index, and whether the reranker keeps the score that retrieved its
+candidates. Each of those returns a plausible number for a question nobody
+asked. The rest covers the closed-form model's recency weighting and the two
+stages joined up.
 
 Nothing here needs the dataset or a GPU. Everything runs on a toy set of a few
 users in a couple of seconds.
@@ -23,7 +25,7 @@ from recsys.pipeline import (
 )
 
 
-# ----------------------------------------------- the four notebook bugs
+# ------------------------------- what goes wrong without raising anything
 def toy(n_users=6, n_items=12, per_user=6):
     """A tiny archive, one interaction per user-item pair.
 
@@ -55,8 +57,8 @@ def toy(n_users=6, n_items=12, per_user=6):
 
 # --------------------------------------------------- index 0 is padding
 def test_no_real_item_is_ever_index_zero():
-    """The original mapped unknown items to index 0 with `.get(item, 0)`, and
-    index 0 was a real item. Every unseen item silently became that one."""
+    """Unknown items get mapped to 0, so 0 must not be a real item: otherwise
+    every unseen item becomes that one and is then trained on."""
     interactions = toy()
     assert PAD == 0
     assert 0 not in interactions.item_to_index.values()
@@ -113,8 +115,9 @@ def test_an_entirely_padded_row_does_not_produce_nan():
 
 # -------------------------------------------- graph node index ordering
 def test_item_nodes_live_above_the_users():
-    """The original sampled negatives from [0, n_items), which in a node index
-    where items start at n_users means every negative was a user node."""
+    """Users and items share one index, items starting at n_users. Negatives
+    drawn from [0, n_items) would all be user nodes, and the ranking loss would
+    push item embeddings away from randomly chosen users."""
     interactions = toy()
     adjacency, n_nodes = build_adjacency(interactions)
 
@@ -342,14 +345,15 @@ def build(beta, graph_scores=None):
 
 
 def test_the_constructor_accepts_beta():
-    """It did not, for one commit, and no test built the class."""
+    """Nothing else in the suite constructs the class, so this is what would
+    catch a keyword the constructor stops accepting."""
     two_stage = build(beta=0.5)
     assert two_stage.beta == 0.5
 
 
 def test_beta_zero_keeps_the_retrieval_order():
-    """With the sequence model given no weight, the output must be exactly the
-    retrieval ranking. This is the property the first version broke."""
+    """With the sequence model given no weight, the output must be exactly
+    the retrieval ranking: beta has to reach all the way to zero."""
     two_stage = build(beta=0.0)
     history = [1, 2]
     ranked = two_stage.recommend_many([(0, history, None)], k=3)[0]
@@ -357,8 +361,8 @@ def test_beta_zero_keeps_the_retrieval_order():
 
 
 def test_beta_one_ignores_the_retrieval_order():
-    """At the other end the reranker decides alone, which is what the original
-    did unconditionally."""
+    """At the other end the reranker decides alone, and the candidate set
+    still has to hold: it reorders, it does not fetch."""
     torch.manual_seed(0)
     two_stage = build(beta=1.0)
     history = [1, 2]
