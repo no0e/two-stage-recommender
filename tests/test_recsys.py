@@ -20,6 +20,9 @@ from recsys.models import (
     BERT4Rec, ContentRecommender, NextItemDataset, RecencyEASE,
     build_adjacency, fit_ease, interaction_matrix, recency_profile,
 )
+from recsys.amazon import FlatSequences
+from recsys.large import retrieve
+from recsys.models import train_bert4rec
 from recsys.pipeline import (
     RetrievalBlend, TwoStageRecommender, _standardise,
 )
@@ -428,3 +431,122 @@ def test_retrieval_blend_returns_the_requested_number():
                                popular=[1, 2]),
                            alpha=1.0, n_candidates=4)
     assert len(blend(0, [1, 2])) == 4
+
+
+# ------------------------------------------- the catalogue-sized shortcuts
+def test_candidate_scoring_matches_the_columns_it_stands_in_for():
+    """Scoring a few columns must give what scoring all of them would.
+
+    This is the shortcut the whole large path rests on: reranking reads 100
+    items per user instead of 162,000. If the gathered output layer were
+    transposed or misaligned it would still return a plausible ranking.
+    """
+    torch.manual_seed(0)
+    model = BERT4Rec(n_items=20, dimension=8, n_heads=2, n_layers=1,
+                     max_length=6).eval()
+    sequences = torch.tensor([[0, 0, 1, 2, 3, 4], [0, 0, 0, 5, 6, 7]])
+    candidates = torch.tensor([[3, 11, 7], [2, 9, 14]])
+
+    with torch.no_grad():
+        full = model(sequences)
+        narrow = model(sequences, candidates=candidates)
+
+    expected = torch.gather(full, 1, candidates)
+    assert torch.allclose(narrow, expected, atol=1e-5)
+
+
+def test_the_sampled_loss_is_finite():
+    """The regression that cost a training run.
+
+    The sampled softmax puts the target in column 0, so its label is 0. PAD is
+    also 0, and the criterion the full softmax uses sets ignore_index=PAD. The
+    two together label every row as ignored, average over an empty set, and
+    return NaN, which propagates into every weight. A NaN model still returns
+    a ranking, so nothing downstream complains.
+    """
+    interactions = toy(n_users=8, n_items=14, per_user=6)
+    sequences = training_sequences(interactions, max_length=6)
+
+    model = train_bert4rec(
+        sequences, interactions.n_items, epochs=1, dimension=8, n_heads=2,
+        n_layers=1, max_length=6, batch_size=4, n_negatives=4, verbose=False)
+
+    assert all(torch.isfinite(p).all() for p in model.parameters())
+
+
+def test_a_non_finite_loss_stops_training():
+    """Rather than returning a model whose every weight is NaN."""
+    interactions = toy(n_users=6, n_items=12, per_user=5)
+    sequences = training_sequences(interactions, max_length=6)
+
+    import recsys.models as models
+
+    original = models.nn.CrossEntropyLoss
+
+    class AlwaysNaN(torch.nn.Module):
+        def forward(self, logits, targets):
+            return logits.sum() * float("nan")
+
+    models.nn.CrossEntropyLoss = lambda *a, **k: AlwaysNaN()
+    try:
+        with pytest.raises(RuntimeError, match="not finite"):
+            train_bert4rec(sequences, interactions.n_items, epochs=1,
+                           dimension=8, n_heads=2, n_layers=1, max_length=6,
+                           batch_size=4, verbose=False)
+    finally:
+        models.nn.CrossEntropyLoss = original
+
+
+def test_retrieval_returns_the_best_unseen_items():
+    """Blocked GPU retrieval, checked against an answer worked out by hand."""
+    item_vectors = np.eye(6, dtype=np.float32)
+    user_vectors = np.array([[0, 1, 2, 3, 4, 5]], dtype=np.float32)
+
+    # Scores are 0..5 by index. PAD is excluded, item 5 is in the history.
+    candidates, values = retrieve(
+        user_vectors, item_vectors, users=[0], histories=[[5]], k=2)
+
+    assert list(candidates[0]) == [4, 3]
+    assert values[0][0] > values[0][1]
+
+
+def test_retrieval_never_returns_padding_or_anything_seen():
+    rng = np.random.default_rng(0)
+    item_vectors = rng.normal(size=(30, 4)).astype(np.float32)
+    user_vectors = rng.normal(size=(5, 4)).astype(np.float32)
+    histories = [[1, 2, 3], [4], [5, 6], [7, 8, 9, 10], [11]]
+
+    candidates, _ = retrieve(user_vectors, item_vectors, users=list(range(5)),
+                             histories=histories, k=8, block=2)
+
+    for row, history in zip(candidates, histories):
+        assert PAD not in row
+        assert not set(row) & set(history)
+        assert len(set(row)) == len(row)
+
+
+def test_the_flat_store_keeps_every_position_as_a_target():
+    """Every item after the first is a target, with a bounded context window.
+
+    This is deliberately not what `training_sequences` does. That one cuts the
+    history down to `max_length` and then takes prefixes, so a user with more
+    interactions than the window loses their early targets entirely. Here the
+    window bounds what the model reads, not what it is asked to predict, and
+    the count below is what says which of the two is running.
+    """
+    interactions = toy(n_users=5, n_items=12, per_user=6)
+    histories = interactions.indexed_histories()
+
+    store = FlatSequences(interactions, max_length=4)
+    assert len(store) == sum(len(h) - 1 for h in histories.values() if len(h) > 1)
+    assert len(store) > len(training_sequences(interactions, max_length=4))
+
+    position = 0
+    for history in histories.values():
+        if len(history) < 2:
+            continue
+        for cut in range(1, len(history)):
+            window, target = store[position]
+            assert list(window) == history[max(0, cut - 4):cut]
+            assert target == history[cut]
+            position += 1

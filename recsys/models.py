@@ -399,6 +399,32 @@ class NextItemDataset(Dataset):
         )
 
 
+class WindowDataset(Dataset):
+    """Pads whatever a source yields as (window, target) to a fixed length.
+
+    `NextItemDataset` holds a list of (user, history, target) triples, which
+    is fine when the histories are copied once. The flat store in
+    `recsys.amazon` hands out a numpy view instead, and this is what turns
+    either of them into a padded tensor.
+    """
+
+    def __init__(self, source, max_length=50):
+        self.source = source
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.source)
+
+    def __getitem__(self, index):
+        window, target = self.source[index]
+        window = np.asarray(window, dtype=np.int64)[-self.max_length:]
+        # PAD is 0, so an empty row is already padded.
+        padded = np.zeros(self.max_length, dtype=np.int64)
+        if len(window):
+            padded[-len(window):] = window
+        return torch.from_numpy(padded), torch.tensor(target, dtype=torch.long)
+
+
 class BERT4Rec(nn.Module):
     """A transformer encoder over the item sequence, scoring the next item."""
 
@@ -419,7 +445,17 @@ class BERT4Rec(nn.Module):
         self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
         self.output = nn.Linear(dimension, n_items)
 
-    def forward(self, sequences):
+    def forward(self, sequences, candidates=None):
+        """Logits over the whole catalogue, or only over `candidates`.
+
+        `candidates` is (batch, n) of item indices. With it, the output layer
+        is gathered per row and multiplied against the pooled state, which
+        turns the cost from the size of the catalogue into the size of the
+        candidate set. Two places need that: reranking reads 100 items per
+        user, and a sampled softmax reads a target plus its negatives. Scoring
+        20,000 users over 162,000 items would otherwise ask for 13 GB of
+        logits that nothing looks at.
+        """
         batch, length = sequences.shape
         positions = torch.arange(length, device=sequences.device)
         x = self.item_embedding(sequences) + self.position_embedding(positions)
@@ -433,23 +469,52 @@ class BERT4Rec(nn.Module):
 
         x = self.encoder(x, src_key_padding_mask=padding_mask)
 
-        logits = self.output(x[:, -1, :])  # left padding, so this is the last
-        logits[:, PAD] = float("-inf")     # never recommend nothing
-        return logits
+        pooled = x[:, -1, :]  # left padding, so the last slot is a real item
+
+        if candidates is None:
+            logits = self.output(pooled)
+            logits[:, PAD] = float("-inf")  # never recommend nothing
+            return logits
+
+        weights = self.output.weight[candidates]          # (batch, n, dim)
+        biases = self.output.bias[candidates]             # (batch, n)
+        scores = torch.bmm(weights, pooled.unsqueeze(-1)).squeeze(-1) + biases
+        return scores.masked_fill(candidates == PAD, float("-inf"))
 
 
 def train_bert4rec(sequences, n_items, epochs=20, dimension=128, n_heads=4,
                    n_layers=2, max_length=50, batch_size=128,
-                   learning_rate=1e-3, device="cpu", seed=0, verbose=True):
+                   learning_rate=1e-3, device="cpu", seed=0, verbose=True,
+                   n_negatives=None, dataset=None, workers=0):
+    """Fit the reranker.
+
+    `n_negatives` turns the loss into a sampled softmax: the target is scored
+    against that many uniform negatives instead of against the whole
+    catalogue. At 1,682 items the full softmax is free and the default leaves
+    it alone. At 162,000 items it is the dominant cost of every step, and
+    scoring a target against 2,048 negatives is eighty times less arithmetic
+    for a gradient that points the same way.
+
+    Negatives are drawn uniformly and are not checked against the target. A
+    collision makes one example unlearnable rather than wrong, and at this
+    catalogue size it happens to about one row in eighty.
+    """
     torch.manual_seed(seed)
     model = BERT4Rec(n_items, dimension, n_heads, n_layers, max_length).to(device)
+    if dataset is None:
+        dataset = NextItemDataset(sequences, max_length)
     loader = DataLoader(
-        NextItemDataset(sequences, max_length),
-        batch_size=batch_size, shuffle=True,
+        dataset, batch_size=batch_size, shuffle=True, num_workers=workers,
+        pin_memory=(workers > 0 and device != "cpu"),
     )
     optimiser = torch.optim.AdamW(
         model.parameters(), lr=learning_rate, weight_decay=0.01)
     criterion = nn.CrossEntropyLoss(ignore_index=PAD)
+    # The sampled loss needs its own criterion. Its label is always column 0,
+    # the position the target is placed at, and PAD is also 0: the shared
+    # criterion would call every single row an ignored one and average over an
+    # empty set, which is a NaN loss and a model of NaN weights.
+    sampled_criterion = nn.CrossEntropyLoss()
 
     best, patience, since_best = float("inf"), 5, 0
     best_state = None
@@ -461,7 +526,26 @@ def train_bert4rec(sequences, n_items, epochs=20, dimension=128, n_heads=4,
             batch_sequences = batch_sequences.to(device)
             targets = targets.to(device)
 
-            loss = criterion(model(batch_sequences), targets)
+            if n_negatives:
+                negatives = torch.randint(
+                    1, n_items, (len(targets), n_negatives), device=device)
+                candidates = torch.cat(
+                    [targets.unsqueeze(1), negatives], dim=1)
+                # The target is column 0 of every row, so the label is 0.
+                loss = sampled_criterion(
+                    model(batch_sequences, candidates=candidates),
+                    torch.zeros(len(targets), dtype=torch.long, device=device),
+                )
+            else:
+                loss = criterion(model(batch_sequences), targets)
+            if not torch.isfinite(loss):
+                raise RuntimeError(
+                    "The reranker loss is not finite on the first steps of "
+                    f"epoch {epoch + 1}. Training from here would only "
+                    "produce NaN weights, and a model of NaN weights still "
+                    "returns a ranking, so this stops rather than reports one."
+                )
+
             optimiser.zero_grad()
             loss.backward()
             optimiser.step()
@@ -490,8 +574,13 @@ def train_bert4rec(sequences, n_items, epochs=20, dimension=128, n_heads=4,
 
 @torch.no_grad()
 def score_sequences(model, histories, max_length=50, device="cpu",
-                    batch_size=256):
-    """Logits for a list of histories, in the order they were given."""
+                    batch_size=256, candidates=None):
+    """Logits for a list of histories, in the order they were given.
+
+    With `candidates`, a list of per-history index lists of equal length, only
+    those columns are computed and the result is (n_histories, n_candidates)
+    instead of (n_histories, n_items).
+    """
     model.eval()
     scores = []
     for start in range(0, len(histories), batch_size):
@@ -501,5 +590,16 @@ def score_sequences(model, histories, max_length=50, device="cpu",
             for h in chunk
         ]
         batch = torch.tensor(padded, dtype=torch.long, device=device)
-        scores.append(model(batch).cpu().numpy())
-    return np.concatenate(scores) if scores else np.zeros((0, model.n_items))
+
+        if candidates is None:
+            scores.append(model(batch).cpu().numpy())
+        else:
+            columns = torch.tensor(
+                candidates[start:start + batch_size], dtype=torch.long,
+                device=device)
+            scores.append(model(batch, candidates=columns).cpu().numpy())
+
+    if scores:
+        return np.concatenate(scores)
+    width = model.n_items if candidates is None else 0
+    return np.zeros((0, width))
