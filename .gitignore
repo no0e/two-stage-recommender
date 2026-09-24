@@ -8,3 +8,4 @@ data/
 
 # docs/results.json and docs/results.png are committed: the README shows
 # the figure, and the figure is drawn from the file.
+logs/
