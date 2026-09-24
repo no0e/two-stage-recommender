@@ -11,6 +11,8 @@ saw a test target, and the test set is touched once at the end.
 On Windows, set OMP_NUM_THREADS=1 before running. Some BLAS builds deadlock on
 matrix inversions above roughly 800 by 800, which is smaller than the item-item
 matrix this fits.
+
+Writes docs/results.json and redraws docs/results.png from it.
 """
 import argparse
 import json
@@ -23,16 +25,17 @@ sys.path.insert(0, str(ROOT))
 
 import torch  # noqa: E402
 
-from recsys.content import ContentRecommender, build_content_matrix, popularity  # noqa: E402
 from recsys.data import load, training_sequences  # noqa: E402
-from recsys.graph import train_lightgcn  # noqa: E402
-from recsys.linear import RecencyEASE  # noqa: E402
 from recsys.metrics import bootstrap_difference, evaluate, hits  # noqa: E402
+from recsys.models import (  # noqa: E402
+    ContentRecommender, RecencyEASE, build_content_matrix, popularity,
+    train_bert4rec, train_lightgcn,
+)
 from recsys.pipeline import (  # noqa: E402
     GraphRecommender, PopularityRecommender, RetrievalBlend,
     SequentialRecommender, TwoStageRecommender, fit_alpha_on_retrieval, fit_beta,
 )
-from recsys.sequential import train_bert4rec  # noqa: E402
+from recsys.plotting import results_figure  # noqa: E402
 
 
 def parse():
@@ -167,9 +170,7 @@ def main():
         print(f"\n  {a} minus {b}: {comparison['difference']:+.4f} "
               f"[{comparison['ci_low']:+.4f}, {comparison['ci_high']:+.4f}]")
 
-    out = Path(args.out)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps({
+    summary = {
         "dataset": interactions.summary(),
         "k": args.k,
         "settings": {
@@ -185,8 +186,13 @@ def main():
         "results": results,
         "comparisons": comparisons,
         "seconds": round(time.time() - started, 1),
-    }, indent=2), encoding="utf-8")
-    print(f"\nWrote {out} in {time.time() - started:.0f}s")
+    }
+
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    figure = results_figure(summary, out.parent / "results.png")
+    print(f"\nWrote {out} and {figure} in {time.time() - started:.0f}s")
 
 
 if __name__ == "__main__":

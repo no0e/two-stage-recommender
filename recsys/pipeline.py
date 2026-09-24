@@ -12,9 +12,8 @@ is never between two differently-shaped experiments.
 """
 import numpy as np
 
-from .content import ContentRecommender
 from .data import PAD
-from .sequential import score_sequences
+from .models import ContentRecommender, score_sequences
 
 
 class Recommender:
@@ -288,31 +287,4 @@ def fit_beta(two_stage, pairs, candidates=(0.0, 0.25, 0.5, 0.75, 1.0), k=10,
 
     best = max(sweep, key=sweep.get)
     two_stage.beta = best
-    return best, sweep
-
-
-def fit_alpha(two_stage, pairs, candidates=(0.0, 0.25, 0.5, 0.75, 1.0), k=10,
-              verbose=True):
-    """Choose the retrieval blend on a validation slice.
-
-    Returns the best alpha and the whole sweep, because a flat sweep and a
-    peaked one say different things about how much the blend matters, and only
-    reporting the winner hides which one happened.
-    """
-    from .metrics import recall_at_k
-
-    sweep = {}
-    for alpha in candidates:
-        two_stage.alpha = alpha
-        ranked = two_stage.recommend_many(pairs, k)
-        hits = [
-            recall_at_k(row, target, k)
-            for row, (_, _, target) in zip(ranked, pairs)
-        ]
-        sweep[alpha] = float(np.mean(hits)) if hits else 0.0
-        if verbose:
-            print(f"  alpha={alpha:.2f}  recall@{k}={sweep[alpha]:.4f}")
-
-    best = max(sweep, key=sweep.get)
-    two_stage.alpha = best
     return best, sweep

@@ -1,0 +1,505 @@
+"""The four models, in the order the pipeline uses them.
+
+`build_content_matrix` and `ContentRecommender` turn a title and its genres into
+a vector, which is the only path that can score an item nobody has touched.
+
+`RecencyEASE` solves for an item-item weight matrix in a single matrix inverse,
+then scores a user by their history weighted towards what they did most
+recently. It is the retrieval stage, and it fits in about a second.
+
+`train_lightgcn` is the graph alternative to that retrieval, propagating user
+and item embeddings over a normalised sparse adjacency. `torch_geometric` is not
+a dependency: the propagation is one sparse matrix multiply per layer.
+
+`train_bert4rec` is the reranking stage: a small transformer over the user's
+sequence, which is the only model here that knows what follows what.
+"""
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import normalize
+from torch.utils.data import DataLoader, Dataset
+
+from .data import PAD
+
+
+# -------------------------------------------------------------- content
+def tfidf_features(texts, max_features=4096):
+    matrix = TfidfVectorizer(
+        max_features=max_features, stop_words="english", sublinear_tf=True,
+    ).fit_transform(texts)
+    return normalize(np.asarray(matrix.todense(), dtype=np.float32))
+
+
+def sbert_features(texts, model_name="all-MiniLM-L6-v2"):
+    """Sentence embeddings. Optional: the import is deliberately local."""
+    from sentence_transformers import SentenceTransformer
+
+    model = SentenceTransformer(model_name, device="cpu")
+    embeddings = model.encode(
+        list(texts), batch_size=256, show_progress_bar=False)
+    return normalize(np.asarray(embeddings, dtype=np.float32))
+
+
+def build_content_matrix(interactions, encoder="tfidf"):
+    """One row per item index, aligned with `item_to_index`, PAD row at zero.
+
+    Rows are L2 normalised, so a dot product between two of them is a cosine
+    similarity and the scoring code never has to normalise again.
+    """
+    items = interactions.items.copy()
+    items["index"] = items["item_id"].map(interactions.item_to_index)
+    items = items[items["index"].notna()].sort_values("index")
+
+    texts = items["text"].fillna("").tolist()
+    features = (
+        sbert_features(texts) if encoder == "sbert" else tfidf_features(texts)
+    )
+
+    matrix = np.zeros((interactions.n_items, features.shape[1]),
+                      dtype=np.float32)
+    matrix[items["index"].to_numpy(dtype=int)] = features
+    return matrix  # row PAD stays zero, so it scores zero against everything
+
+
+def popularity(interactions, top=500):
+    """Item indices by training frequency. The fallback of last resort."""
+    counts = interactions.train["item_id"].value_counts()
+    ranked = [
+        interactions.item_to_index[item]
+        for item in counts.index if item in interactions.item_to_index
+    ]
+    return ranked[:top]
+
+
+class ContentRecommender:
+    """Cold start: score by similarity to what the user has already liked.
+
+    With no history at all there is nothing to be similar to, and the honest
+    answer is the popular list rather than an arbitrary ranking dressed up as a
+    personalised one.
+    """
+
+    def __init__(self, content_matrix, popular):
+        self.content = content_matrix
+        self.popular = popular
+
+    def user_profile(self, history):
+        """The mean of the content rows of what the user has seen."""
+        history = [i for i in history if i != PAD]
+        if not history:
+            return None
+        profile = self.content[history].mean(axis=0)
+        norm = np.linalg.norm(profile)
+        return profile / norm if norm > 0 else None
+
+    def scores(self, history):
+        profile = self.user_profile(history)
+        if profile is None:
+            scores = np.zeros(len(self.content), dtype=np.float32)
+            # Descending so the most popular item keeps the highest score.
+            for rank, index in enumerate(self.popular):
+                scores[index] = 1.0 - rank / max(len(self.popular), 1)
+            return scores
+        return self.content @ profile
+
+    def recommend(self, history, k=10):
+        scores = self.scores(history)
+        seen = set(history)
+        order = np.argsort(-scores)
+        out = []
+        for index in order:
+            if index == PAD or index in seen:
+                continue
+            out.append(int(index))
+            if len(out) == k:
+                break
+        return out
+
+
+# -------------------------------------- the closed-form retrieval model
+def interaction_matrix(interactions, frame=None):
+    """Users by items, one where the interaction happened."""
+    frame = interactions.train if frame is None else frame
+    rows = frame["user_id"].map(interactions.user_to_index)
+    columns = frame["item_id"].map(interactions.item_to_index)
+    keep = rows.notna() & columns.notna()
+
+    matrix = np.zeros(
+        (interactions.n_users, interactions.n_items), dtype=np.float32)
+    matrix[rows[keep].to_numpy(int), columns[keep].to_numpy(int)] = 1.0
+    return matrix
+
+
+def fit_ease(matrix, l2=100.0):
+    """The EASE weight matrix: B = -P / diag(P), zero on the diagonal.
+
+    The zero diagonal is the whole trick. Without it the closed-form solution
+    is the identity, which reconstructs each item from itself perfectly and
+    recommends nothing. Constraining it to zero forces every item to be
+    explained by the others, and `l2` is what stops that explanation from
+    memorising the training matrix.
+    """
+    gram = (matrix.T @ matrix).astype(np.float64)
+    np.fill_diagonal(gram, np.diag(gram) + l2)
+
+    precision = np.linalg.inv(gram)
+    weights = -precision / np.diag(precision)
+    np.fill_diagonal(weights, 0.0)
+    return weights.astype(np.float32)
+
+
+def recency_profile(history, n_items, half_life=20.0):
+    """The user vector to score with, weighted towards recent items.
+
+    The last item weighs one and the weight halves every `half_life` steps
+    back. `half_life=None` gives the unordered bag, which is what plain EASE
+    uses and what this exists to improve on.
+    """
+    profile = np.zeros(n_items, dtype=np.float32)
+    if not len(history):
+        return profile
+    if half_life is None:
+        profile[list(history)] = 1.0
+        return profile
+
+    positions = np.arange(len(history))
+    ages = (len(history) - 1) - positions
+    weights = np.power(0.5, ages / float(half_life)).astype(np.float32)
+    # An item seen more than once keeps its most recent weight, not the sum,
+    # so a rewatched film does not outrank everything by repetition alone.
+    np.maximum.at(profile, np.asarray(history, dtype=int), weights)
+    return profile
+
+
+class RecencyEASE:
+    """Retrieval by item-item weights over a recency-weighted profile.
+
+    Scores from the history alone and never looks the user up, so a user the
+    model has never seen is handled by the same code path as everyone else,
+    provided they have done something. That is one fewer special case than the
+    graph model needs.
+    """
+
+    def __init__(self, interactions, l2=100.0, half_life=20.0):
+        self.interactions = interactions
+        self.half_life = half_life
+        self.weights = fit_ease(interaction_matrix(interactions), l2=l2)
+
+    def scores(self, user, history):
+        if not len(history):
+            return None  # nothing to be similar to; the cold path takes over
+        profile = recency_profile(
+            history, self.interactions.n_items, self.half_life)
+        return profile @ self.weights
+
+    def __call__(self, user, history, k=100):
+        from .pipeline import _top
+
+        scores = self.scores(user, history)
+        if scores is None:
+            return []
+        return _top(scores, history, k)
+
+    def recommend_many(self, triples, k=100):
+        from .pipeline import _top
+
+        out = []
+        for user, history, _ in triples:
+            scores = self.scores(user, history)
+            out.append([] if scores is None else _top(scores, history, k))
+        return out
+
+
+# -------------------------------------------- LightGCN, the alternative
+def build_adjacency(interactions, device="cpu"):
+    """The symmetric, degree-normalised user-item graph as a sparse tensor.
+
+    Nodes are users first, then items, so item `i` is node `n_users + i`.
+    """
+    train = interactions.train
+    pairs = train[["user_id", "item_id"]].drop_duplicates()
+    users = pairs["user_id"].map(interactions.user_to_index)
+    items = pairs["item_id"].map(interactions.item_to_index)
+
+    keep = users.notna() & items.notna()
+    users = users[keep].to_numpy(dtype=np.int64)
+    items = items[keep].to_numpy(dtype=np.int64) + interactions.n_users
+
+    rows = np.concatenate([users, items])
+    columns = np.concatenate([items, users])
+    n_nodes = interactions.n_users + interactions.n_items
+
+    degrees = np.bincount(rows, minlength=n_nodes).astype(np.float32)
+    # An isolated node keeps a degree of one so its normalisation stays finite;
+    # it has no edges, so the value never reaches anything.
+    inverse_sqrt = 1.0 / np.sqrt(np.maximum(degrees, 1.0))
+    values = inverse_sqrt[rows] * inverse_sqrt[columns]
+
+    indices = torch.tensor(np.stack([rows, columns]), dtype=torch.long)
+    adjacency = torch.sparse_coo_tensor(
+        indices, torch.tensor(values, dtype=torch.float32),
+        (n_nodes, n_nodes),
+    ).coalesce()
+    return adjacency.to(device), n_nodes
+
+
+class LightGCN(nn.Module):
+    """Embeddings smoothed over the interaction graph.
+
+    No weights beyond the embedding table itself, which is the point of
+    LightGCN: the layers have nothing to learn, they only average a node's
+    neighbourhood, and the final representation is the mean across depths.
+    """
+
+    def __init__(self, n_nodes, n_users, dimension=64, n_layers=3):
+        super().__init__()
+        self.embedding = nn.Embedding(n_nodes, dimension)
+        nn.init.normal_(self.embedding.weight, std=0.1)
+        self.n_layers = n_layers
+        self.n_users = n_users
+
+    def forward(self, adjacency):
+        x = self.embedding.weight
+        layers = [x]
+        for _ in range(self.n_layers):
+            x = torch.sparse.mm(adjacency, x)
+            layers.append(x)
+        return torch.stack(layers).mean(dim=0)
+
+    def split(self, adjacency):
+        """(user embeddings, item embeddings), item index aligned with PAD at 0."""
+        nodes = self.forward(adjacency)
+        return nodes[:self.n_users], nodes[self.n_users:]
+
+
+def bpr_loss(user_embeddings, positive, negative, weight_decay=1e-4):
+    """Bayesian personalised ranking: the observed item outranks a random one."""
+    positive_scores = (user_embeddings * positive).sum(dim=1)
+    negative_scores = (user_embeddings * negative).sum(dim=1)
+    ranking = -F.logsigmoid(positive_scores - negative_scores).mean()
+    regularisation = weight_decay * (
+        user_embeddings.pow(2).sum()
+        + positive.pow(2).sum()
+        + negative.pow(2).sum()
+    ) / len(user_embeddings)
+    return ranking + regularisation
+
+
+def sample_negatives(users, n_items, observed_codes, generator, rounds=4):
+    """One unobserved item per user, sampled without a Python loop.
+
+    The obvious implementation walks the batch and resamples inside a `while`,
+    which on a hundred thousand edges is most of the training time. Here the
+    observed pairs are encoded as a single sorted integer array, membership is
+    one `searchsorted`, and only the colliding entries are redrawn. A handful of
+    rounds leaves a negligible number of collisions, and a collision is a
+    false negative rather than a crash.
+    """
+    negatives = generator.integers(1, n_items, size=len(users))
+    for _ in range(rounds):
+        codes = users * n_items + negatives
+        position = np.searchsorted(observed_codes, codes)
+        position = np.clip(position, 0, len(observed_codes) - 1)
+        collides = observed_codes[position] == codes
+        if not collides.any():
+            break
+        negatives[collides] = generator.integers(
+            1, n_items, size=int(collides.sum()))
+    return negatives
+
+
+def train_lightgcn(interactions, epochs=300, dimension=64, n_layers=3,
+                   learning_rate=1e-2, weight_decay=1e-4, batch_size=None,
+                   device="cpu", seed=0, verbose=True):
+    """Fit the retrieval stage and return the two embedding tables.
+
+    Full batch by default. Every step needs the propagation recomputed over the
+    whole graph, so a mini-batch costs the same as a full one and buys only a
+    noisier gradient; with `batch_size=None` there is one propagation per epoch
+    instead of one per mini-batch.
+    """
+    torch.manual_seed(seed)
+    generator = np.random.default_rng(seed)
+
+    adjacency, n_nodes = build_adjacency(interactions, device)
+    model = LightGCN(n_nodes, interactions.n_users, dimension, n_layers).to(device)
+    optimiser = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+    pairs = interactions.train[["user_id", "item_id"]].drop_duplicates()
+    keep = pairs["user_id"].isin(interactions.user_to_index) \
+        & pairs["item_id"].isin(interactions.item_to_index)
+    pairs = pairs[keep]
+    user_index = pairs["user_id"].map(interactions.user_to_index).to_numpy(np.int64)
+    item_index = pairs["item_id"].map(interactions.item_to_index).to_numpy(np.int64)
+
+    # Sampling a negative the user has actually seen teaches the model the
+    # opposite of the truth, so the observed pairs are held as sorted codes.
+    observed_codes = np.sort(user_index * interactions.n_items + item_index)
+
+    users = torch.tensor(user_index, device=device)
+    items = torch.tensor(item_index, device=device)
+    size = batch_size or len(users)
+
+    for epoch in range(epochs):
+        model.train()
+        order = np.random.default_rng(seed + epoch).permutation(len(users))
+        total, steps = 0.0, 0
+
+        for start in range(0, len(order), size):
+            chunk = order[start:start + size]
+            batch_users = users[chunk]
+            negatives = torch.tensor(
+                sample_negatives(user_index[chunk], interactions.n_items,
+                                 observed_codes, generator),
+                device=device,
+            )
+
+            user_vectors, item_vectors = model.split(adjacency)
+            loss = bpr_loss(
+                user_vectors[batch_users], item_vectors[items[chunk]],
+                item_vectors[negatives], weight_decay=weight_decay,
+            )
+            optimiser.zero_grad()
+            loss.backward()
+            optimiser.step()
+            total += loss.item()
+            steps += 1
+
+        if verbose and (epoch + 1) % 50 == 0:
+            print(f"  LightGCN epoch {epoch + 1:4d}  "
+                  f"BPR loss {total / max(steps, 1):.4f}")
+
+    model.eval()
+    with torch.no_grad():
+        user_vectors, item_vectors = model.split(adjacency)
+    return user_vectors.cpu().numpy(), item_vectors.cpu().numpy()
+
+
+# ---------------------------------------- BERT4Rec, the reranking stage
+class NextItemDataset(Dataset):
+    """(padded history, next item), with the padding on the left."""
+
+    def __init__(self, sequences, max_length=50):
+        self.sequences = sequences
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.sequences)
+
+    def __getitem__(self, index):
+        _, history, target = self.sequences[index]
+        history = history[-self.max_length:]
+        padding = [PAD] * (self.max_length - len(history))
+        return (
+            torch.tensor(padding + history, dtype=torch.long),
+            torch.tensor(target, dtype=torch.long),
+        )
+
+
+class BERT4Rec(nn.Module):
+    """A transformer encoder over the item sequence, scoring the next item."""
+
+    def __init__(self, n_items, dimension=128, n_heads=4, n_layers=2,
+                 max_length=50, dropout=0.2):
+        super().__init__()
+        self.n_items = n_items
+        self.max_length = max_length
+
+        self.item_embedding = nn.Embedding(n_items, dimension, padding_idx=PAD)
+        self.position_embedding = nn.Embedding(max_length, dimension)
+        self.dropout = nn.Dropout(dropout)
+
+        layer = nn.TransformerEncoderLayer(
+            d_model=dimension, nhead=n_heads, dim_feedforward=dimension * 4,
+            dropout=dropout, activation="gelu", batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
+        self.output = nn.Linear(dimension, n_items)
+
+    def forward(self, sequences):
+        batch, length = sequences.shape
+        positions = torch.arange(length, device=sequences.device)
+        x = self.item_embedding(sequences) + self.position_embedding(positions)
+        x = self.dropout(x)
+
+        padding_mask = sequences == PAD
+        # A row that is entirely padding would make softmax divide by zero, so
+        # its last slot is unmasked. It contributes nothing either way, but a
+        # NaN here would poison the whole batch.
+        padding_mask[padding_mask.all(dim=1), -1] = False
+
+        x = self.encoder(x, src_key_padding_mask=padding_mask)
+
+        logits = self.output(x[:, -1, :])  # left padding, so this is the last
+        logits[:, PAD] = float("-inf")     # never recommend nothing
+        return logits
+
+
+def train_bert4rec(sequences, n_items, epochs=20, dimension=128, n_heads=4,
+                   n_layers=2, max_length=50, batch_size=128,
+                   learning_rate=1e-3, device="cpu", seed=0, verbose=True):
+    torch.manual_seed(seed)
+    model = BERT4Rec(n_items, dimension, n_heads, n_layers, max_length).to(device)
+    loader = DataLoader(
+        NextItemDataset(sequences, max_length),
+        batch_size=batch_size, shuffle=True,
+    )
+    optimiser = torch.optim.AdamW(
+        model.parameters(), lr=learning_rate, weight_decay=0.01)
+    criterion = nn.CrossEntropyLoss(ignore_index=PAD)
+
+    best, patience, since_best = float("inf"), 5, 0
+    best_state = None
+
+    for epoch in range(epochs):
+        model.train()
+        total = 0.0
+        for batch_sequences, targets in loader:
+            batch_sequences = batch_sequences.to(device)
+            targets = targets.to(device)
+
+            loss = criterion(model(batch_sequences), targets)
+            optimiser.zero_grad()
+            loss.backward()
+            optimiser.step()
+            total += loss.item()
+
+        average = total / len(loader)
+        if verbose:
+            print(f"  BERT4Rec epoch {epoch + 1:2d}  loss {average:.4f}")
+
+        if average < best - 1e-4:
+            best, since_best = average, 0
+            best_state = {k: v.detach().clone()
+                          for k, v in model.state_dict().items()}
+        else:
+            since_best += 1
+            if since_best >= patience:
+                if verbose:
+                    print(f"  stopped early at epoch {epoch + 1}")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    model.eval()
+    return model
+
+
+@torch.no_grad()
+def score_sequences(model, histories, max_length=50, device="cpu",
+                    batch_size=256):
+    """Logits for a list of histories, in the order they were given."""
+    model.eval()
+    scores = []
+    for start in range(0, len(histories), batch_size):
+        chunk = histories[start:start + batch_size]
+        padded = [
+            [PAD] * (max_length - len(h[-max_length:])) + list(h[-max_length:])
+            for h in chunk
+        ]
+        batch = torch.tensor(padded, dtype=torch.long, device=device)
+        scores.append(model(batch).cpu().numpy())
+    return np.concatenate(scores) if scores else np.zeros((0, model.n_items))

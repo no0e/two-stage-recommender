@@ -1,6 +1,6 @@
 """The results figure.
 
-One style block so the four panels read as one set. Categorical hues assigned
+One style block so the two panels read as one set. Categorical hues assigned
 in fixed order and never cycled, one hue light to dark for magnitude, recessive
 grid and axes, direct labels where a number is worth reading off, and a legend
 whenever two series share a panel.
@@ -22,8 +22,7 @@ INK_MUTED = "#898781"
 GRID = "#e1e0d9"
 BASELINE = "#c3c2b7"
 
-SERIES_1 = "#2a78d6"   # blue
-SERIES_2 = "#eb6834"   # orange
+SERIES_1 = "#2a78d6"
 SEQUENTIAL = ["#9ec5f4", "#6da7ec", "#3987e5", "#2a78d6", "#256abf", "#1c5cab"]
 
 LABELS = {
@@ -89,72 +88,6 @@ def panel_recall(ax, results, k):
     _strip(ax)
 
 
-def panel_intervals(ax, comparisons, k):
-    """Each system minus the popularity baseline, with its interval.
-
-    The interval is what makes the panel worth drawing: three differences that
-    all look like wins are only wins if their intervals clear zero.
-    """
-    names = ["bert4rec", "lightgcn", "ease", "two_stage"]
-    y = np.arange(len(names))
-
-    ax.axvline(0, color=BASELINE, linewidth=1.2, linestyle=(0, (3, 3)),
-               zorder=1)
-    for yi, name in zip(y, names):
-        comparison = comparisons[f"{name}_vs_popularity"]
-        ax.hlines(yi, comparison["ci_low"], comparison["ci_high"],
-                  color=SERIES_1, linewidth=2.2, alpha=0.45, zorder=2)
-        ax.scatter([comparison["difference"]], [yi], s=70, color=SERIES_1,
-                   zorder=4, edgecolor=SURFACE, linewidth=2)
-        ax.annotate(f"{comparison['difference']:+.3f}",
-                    (comparison["difference"], yi),
-                    textcoords="offset points", xytext=(0, 12), ha="center",
-                    fontsize=8.5, color=INK, fontweight="bold")
-
-    ax.set_yticks(y)
-    ax.set_yticklabels([LABELS[name] for name in names])
-    ax.set_ylim(-0.6, len(names) - 0.25)
-    ax.set_xlabel(f"Recall@{k} above the popularity baseline")
-    ax.set_title("All four clear zero, 2000 paired resamples")
-    ax.grid(axis="y", visible=False)
-    _strip(ax)
-
-
-def panel_beta(ax, sweep, k):
-    """How much of the final order the reranker should set.
-
-    The panel with a finding in it. At beta = 1 the sequence model reorders the
-    candidates on its own opinion and the retrieval score is discarded, which
-    is what the competition version did; it is the worst point on the curve,
-    below even leaving the retrieval order untouched.
-    """
-    betas = sorted(float(b) for b in sweep)
-    values = [sweep[str(b)] for b in betas]
-
-    ax.plot(betas, values, color=SERIES_1, linewidth=2, zorder=3)
-    ax.scatter(betas, values, s=40, color=SERIES_1, zorder=4,
-               edgecolor=SURFACE, linewidth=1.6)
-
-    best = max(range(len(betas)), key=lambda i: values[i])
-    for i in (0, best, len(betas) - 1):
-        ax.annotate(f"{values[i]:.3f}", (betas[i], values[i]),
-                    textcoords="offset points", xytext=(0, 11), ha="center",
-                    fontsize=8.5, color=INK, fontweight="bold")
-    ax.annotate("retrieval order untouched", (betas[0], values[0]),
-                textcoords="offset points", xytext=(6, -26), fontsize=7.5,
-                color=INK_MUTED)
-    ax.annotate("reranker alone, as first written",
-                (betas[-1], values[-1]), textcoords="offset points",
-                xytext=(-8, 16), ha="right", fontsize=7.5, color=INK_MUTED)
-
-    ax.set_xticks(betas)
-    ax.set_xlabel("beta: how much of the order the reranker sets")
-    ax.set_ylabel(f"Recall@{k} on validation")
-    ax.set_title("Reranking helps only if it keeps the retrieval score")
-    ax.grid(axis="x", visible=False)
-    _strip(ax)
-
-
 def panel_coverage(ax, results, k):
     """Recall against catalogue coverage, which is the popularity trap.
 
@@ -164,8 +97,8 @@ def panel_coverage(ax, results, k):
     """
     # Two-stage and EASE sit almost on top of each other, so the labels
     # alternate above and below rather than collide.
-    offsets = {"popularity": (0, 14, "center"), "bert4rec": (0, 14, "center"),
-               "lightgcn": (-10, -6, "right"), "ease": (0, -20, "center"),
+    offsets = {"popularity": (12, -3, "left"), "bert4rec": (-12, -3, "right"),
+               "lightgcn": (0, -18, "center"), "ease": (13, -4, "left"),
                "two_stage": (0, 14, "center")}
     for name in ORDER:
         x = results[name]["catalogue_coverage"]
@@ -189,26 +122,23 @@ def panel_coverage(ax, results, k):
 
 def results_figure(summary, path):
     apply_style()
-    figure, axes = plt.subplots(2, 2, figsize=(12.5, 8.4))
+    figure, axes = plt.subplots(1, 2, figsize=(12.5, 4.3))
     k = summary["k"]
 
-    panel_recall(axes[0, 0], summary["results"], k)
-    panel_intervals(axes[0, 1], summary["comparisons"], k)
-    panel_beta(axes[1, 0], summary["beta_sweep"], k)
-    panel_coverage(axes[1, 1], summary["results"], k)
+    panel_recall(axes[0], summary["results"], k)
+    panel_coverage(axes[1], summary["results"], k)
 
     figure.suptitle(
         "Two-stage recommendation, measured against what is free",
-        fontsize=13, fontweight="bold", color=INK, x=0.012, ha="left", y=0.985,
+        fontsize=13, fontweight="bold", color=INK, x=0.012, ha="left", y=0.99,
     )
     figure.text(
-        0.012, 0.945,
-        "MovieLens 100k, leave-one-out: the last item of each user is the "
-        "target and everything before it trains. 943 users, 1,682 items. "
-        "Every weight fitted on a split one step further back.",
+        0.012, 0.912,
+        "MovieLens 100k, leave-one-out: the last film of each user is the "
+        "target and everything before it trains. 943 users, 1,682 films.",
         fontsize=8.5, color=INK_MUTED, ha="left",
     )
-    figure.tight_layout(rect=[0, 0, 1, 0.925])
+    figure.tight_layout(rect=[0, 0, 1, 0.9])
     figure.savefig(path, dpi=150)
     plt.close(figure)
     return path

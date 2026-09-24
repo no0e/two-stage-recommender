@@ -10,7 +10,6 @@ build content features from.
 import argparse
 import io
 import ssl
-import sys
 import urllib.request
 import zipfile
 from pathlib import Path

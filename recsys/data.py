@@ -12,7 +12,6 @@ whichever real item happened to sort first, and then trained on it.
 """
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
