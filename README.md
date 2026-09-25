@@ -80,6 +80,43 @@ Reproduce with `python scripts/evaluate.py`, which retrains everything and
 rewrites the table and the figure. About four minutes on a GPU, half an hour on
 a laptop CPU.
 
+## At a larger scale
+
+MovieLens has 1,682 items, which is small enough that a closed-form item-item
+model is the best thing in this repository. Two public Amazon categories say
+where that stops. Recall@10 over 20,000 held-out users:
+
+| | Video_Games | Toys_and_Games |
+|---|---|---|
+| Items | 25,612 | 162,035 |
+| Users | 94,762 | 432,264 |
+| Interactions | 814,586 | 3,861,886 |
+| Most popular | 0.0240 | 0.0050 |
+| LightGCN alone | 0.0668 | 0.0221 |
+| BERT4Rec alone | 0.0683 | 0.0249 |
+| **LightGCN to BERT4Rec** | 0.0860 | **0.0295** |
+| Recency EASE | **0.0893** | 391 GiB needed |
+
+The closed form is not beaten, it is outgrown. Its matrix is the square of the
+catalogue and the inverse needs a second one, so at 162,035 items it asks for
+391 GiB on a 200 GiB machine. At 25,612 it still fits, in 197 seconds, and
+still wins. That is the whole argument for the graph: not that it is more
+accurate, but that it is still there at the next size.
+
+Reranking earns its place at both: +0.0192 [+0.0160, +0.0223] over the graph
+alone on Video_Games, +0.0075 [+0.0058, +0.0093] on Toys_and_Games. beta was
+fitted separately on each and came out at 0.75 both times, with the same shape
+either side — handing the reranker the whole order is worse than handing it
+three quarters.
+
+```bash
+python scripts/evaluate_amazon.py --category Video_Games --with-ease
+python scripts/evaluate_amazon.py --category Toys_and_Games
+```
+
+The data downloads itself. Four hours for the larger one on one 15 GB GPU, and
+`docs/amazon_*.json` holds what each run measured.
+
 ## Layout
 
 ```
@@ -87,13 +124,20 @@ recsys/data.py       loading, the split, the padding-safe index
 recsys/models.py     content, EASE, LightGCN, BERT4Rec
 recsys/pipeline.py   the two stages joined, and the baselines
 recsys/metrics.py    recall, NDCG, coverage, paired bootstrap
-scripts/             fetch_data, recommend, evaluate
-tests/               34 tests, no dataset or GPU needed
+recsys/amazon.py     the larger catalogues, and prefixes without copies
+recsys/large.py      blocked retrieval, candidate-only reranking
+scripts/             fetch_data, recommend, evaluate, evaluate_amazon
+tests/               40 tests, no dataset or GPU needed
 notebooks/           the competition notebook, as it was run
 ```
 
 `torch_geometric` is not a dependency — LightGCN propagation is one normalised
 sparse matrix multiply per layer.
+
+Nothing in the large path builds a users-by-items array. Retrieval multiplies a
+block of users against the item table and takes the top hundred before the
+block is released; reranking scores those hundred columns rather than all
+162,035, and training samples its softmax for the same reason.
 
 On Windows, set `OMP_NUM_THREADS=1` first: some BLAS builds deadlock on matrix
 inversions larger than about 800 by 800, which the item-item matrix is.
