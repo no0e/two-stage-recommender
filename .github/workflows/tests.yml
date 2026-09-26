@@ -1,0 +1,44 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install a CPU-only torch
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+      - run: python -m pytest tests/ -q
+
+  end-to-end:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+      - name: The command the README opens with
+        run: python scripts/recommend.py --category Video_Games --epochs 3
+      - name: A short pass over the whole pipeline
+        run: |
+          python scripts/evaluate.py --category Video_Games \
+            --max-users 3000 --eval-users 200 --candidates 20 \
+            --lightgcn-epochs 3 --bert-epochs 1 --negatives 64 \
+            --bert-batch 128 --workers 0 \
+            --out /tmp/smoke.json
