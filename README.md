@@ -45,6 +45,43 @@ underneath. `--user` picks another one, `--rerank` adds the second stage.
 
 ## What it does
 
+```mermaid
+flowchart LR
+    H[/"a user, and their history"/]
+
+    subgraph RET["«stage 1» retrieval · whole catalogue · cheap"]
+        direction TB
+        E["RecencyEASE<br/>closed form, half-life 20"]
+        G["LightGCN<br/>sparse propagation, no graph library"]
+        C["ContentRecommender<br/>TF-IDF, cold start"]
+        B["blend<br/>α·model + (1−α)·content"]
+        E --> B
+        G --> B
+        C --> B
+    end
+
+    subgraph RER["«stage 2» reranking · 100 items · expensive"]
+        direction TB
+        S["BERT4Rec<br/>left-padded, candidate-only logits"]
+        M["blend<br/>β·sequence + (1−β)·retrieval"]
+        S --> M
+    end
+
+    H --> E
+    H --> G
+    H --> C
+    B --> CAND["top 100 candidates<br/>and the scores that retrieved them"]
+    CAND --> S
+    CAND -. "the retrieval score is kept,<br/>not thrown away" .-> M
+    M --> TOP(["top 10"])
+```
+
+α and β are fitted on a split taken one step further back, with models that
+never saw a test target. On MovieLens α came out at 1.0 — the content model
+earns its place as the cold-start path rather than as part of the blend — and β
+at 0.5. The Amazon runs retrieve with LightGCN alone and fitted β at 0.75 on
+both categories.
+
 **Retrieval** narrows 1,682 films to 100 candidates. EASE solves for an
 item-item weight matrix in a single matrix inverse — no epochs, no learning
 rate, about a second — and scores a user by their history weighted so recent
@@ -53,9 +90,6 @@ and a TF-IDF content model covers users and items with no history.
 
 **Reranking** orders those 100 with BERT4Rec, a small transformer over the
 user's sequence, blended with the retrieval score rather than replacing it.
-
-The two blend weights are fitted on a validation split taken one step further
-back, using models that never saw a test target.
 
 ## Results
 
