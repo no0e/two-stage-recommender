@@ -1,25 +1,16 @@
-"""Amazon Reviews 2023, at a size where the shortcuts stop working.
+"""Amazon Reviews 2023: the catalogues this is built for.
 
-MovieLens has 1,682 items, which is small enough that everything fits in a
-dense array and a closed-form item-item model is the best thing in the
-repository. That stops being true quickly. The item-item matrix EASE inverts
-grows with the square of the catalogue and the inverse with its cube:
-
-    catalogue     Gram matrix (float64)
-        1,682                    23 MB
-       25,612                   5.2 GB
-      162,035                   196 GiB
-
-The last row is the point. On the machine this was run on, 200 GiB is the
-whole memory limit, and `np.linalg.inv` needs a second array the same size as
-the first. So above a certain catalogue the choice is not which model scores
-better, it is which model runs at all.
-
-This module loads the 5-core benchmark files published by the McAuley lab at
-UCSD. They are public, one file per category, and already filtered so every
-user and every item has at least five interactions.
+The 5-core benchmark files published by the McAuley lab at UCSD. They are
+public, one file per category, and already filtered so every user and every
+item has at least five interactions.
 
     https://mcauleylab.ucsd.edu/public_datasets/data/amazon_2023/
+
+Two sizes are used here. Video_Games has 25,612 items and is small enough to
+iterate on. Toys_and_Games has 162,035, which is where the shortcuts that make
+a recommender easy to write stop being available: a dense score matrix over
+that catalogue is 13 GB for a single evaluation, and a softmax over it is the
+whole cost of a training step.
 """
 import gzip
 import shutil
@@ -69,7 +60,7 @@ def download(category, data_dir=None):
 
 def load_amazon(category="Toys_and_Games", data_dir=None, min_history=4,
                 max_users=None, seed=0):
-    """One category as an `Interactions`, same object the MovieLens path uses.
+    """One category, as the `Interactions` the rest of the package takes.
 
     The columns are renamed to match, and a stub catalogue frame is built from
     the item ids: the rating-only files carry no titles, and nothing in the
@@ -116,23 +107,20 @@ def load_amazon(category="Toys_and_Games", data_dir=None, min_history=4,
 class FlatSequences:
     """Every prefix of every history, without copying any of them.
 
-    `training_sequences` builds one Python list per prefix. On MovieLens that
-    is 99,000 small lists and nobody notices. On a few million interactions it
-    is the largest object in the process, because the prefixes of one history
-    of length n hold n(n+1)/2 integers between them.
+    Holding each prefix as its own list is the obvious way to write this, and
+    it is the largest object in the process once there are a few million
+    interactions: the prefixes of one history of length n hold n(n+1)/2
+    integers between them.
 
     Here the histories are concatenated into one int32 array and a prefix is
     two offsets into it. Memory is the number of interactions, not the sum of
     the squares of the history lengths, and the padded window is cut straight
     out of the flat array.
 
-    One behavioural difference, and it is not incidental. `training_sequences`
-    truncates a history to `max_length` and then takes its prefixes, so a user
-    with more interactions than the window contributes nothing from before it.
-    Here the window bounds what the model reads and every position after the
-    first is still a target. On these Amazon categories the median history is
-    seven against a window of fifty, so the two agree for almost every user;
-    on a dataset of long histories they would not.
+    The window bounds what the model reads, not what it is asked to predict:
+    every position after the first is a target, including those further back
+    than the window. Cutting each history to `max_length` first would drop the
+    early targets of every long user and nothing would say so.
     """
 
     def __init__(self, interactions, max_length=50):

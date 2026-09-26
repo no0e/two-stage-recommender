@@ -12,10 +12,6 @@ jobs:
       fail-fast: false
       matrix:
         python: ["3.10", "3.11", "3.12"]
-    env:
-      # Some BLAS builds deadlock on the item-item inverse. Pinning the thread
-      # count costs nothing here and makes the run deterministic.
-      OMP_NUM_THREADS: "1"
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -29,8 +25,6 @@ jobs:
 
   end-to-end:
     runs-on: ubuntu-latest
-    env:
-      OMP_NUM_THREADS: "1"
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -39,8 +33,12 @@ jobs:
       - run: |
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements.txt
-      - run: python scripts/fetch_data.py
       - name: The command the README opens with
-        run: python scripts/recommend.py
+        run: python scripts/recommend.py --category Video_Games --epochs 3
       - name: A short pass over the whole pipeline
-        run: python scripts/evaluate.py --lightgcn-epochs 5 --bert-epochs 1
+        run: |
+          python scripts/evaluate.py --category Video_Games \
+            --max-users 3000 --eval-users 200 --candidates 20 \
+            --lightgcn-epochs 3 --bert-epochs 1 --negatives 64 \
+            --bert-batch 128 --workers 0 \
+            --out /tmp/smoke.json

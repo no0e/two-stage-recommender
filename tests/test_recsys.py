@@ -4,27 +4,25 @@ Most of it pins the things that go wrong without raising anything: which index
 means padding, which side a sequence is padded on, where item nodes sit in the
 graph index, and whether the reranker keeps the score that retrieved its
 candidates. Each of those returns a plausible number for a question nobody
-asked. The rest covers the closed-form model's recency weighting and the two
-stages joined up.
+asked.
 
-Nothing here needs the dataset or a GPU. Everything runs on a toy set of a few
-users in a couple of seconds.
+The rest covers the two shortcuts the size of these catalogues forces: scoring
+a handful of candidate columns instead of 162,035, and holding every prefix of
+every history as offsets into one array instead of as its own list.
+
+Nothing here needs a downloaded category or a GPU. Everything runs on a toy set
+of a few users in a couple of seconds.
 """
 import numpy as np
 import pandas as pd
 import pytest
 import torch
 
-from recsys.data import PAD, Interactions, training_sequences
-from recsys.models import (
-    BERT4Rec, ContentRecommender, NextItemDataset, RecencyEASE,
-    build_adjacency, fit_ease, interaction_matrix, recency_profile,
-)
 from recsys.amazon import FlatSequences
-from recsys.large import retrieve
-from recsys.models import train_bert4rec
-from recsys.pipeline import (
-    RetrievalBlend, TwoStageRecommender, _standardise,
+from recsys.data import PAD, Interactions
+from recsys.large import rerank, retrieve
+from recsys.models import (
+    BERT4Rec, WindowDataset, build_adjacency, train_bert4rec,
 )
 
 
@@ -32,9 +30,9 @@ from recsys.pipeline import (
 def toy(n_users=6, n_items=12, per_user=6):
     """A tiny archive, one interaction per user-item pair.
 
-    No repeats within a user, which is the shape MovieLens has: a rating is
-    given once. A generator that repeated items would make the leave-one-out
-    tests below vacuous, since the held-out item would also sit in the history.
+    No repeats within a user, which is the shape the 5-core files have. A
+    generator that repeated items would make the leave-one-out tests below
+    vacuous, since the held-out item would also sit in the history.
     """
     rows = []
     stamp = 0
@@ -81,7 +79,7 @@ def test_padding_is_never_recommended():
 def test_padding_goes_on_the_left():
     """The prediction is read off the last position, so padding on the right
     would mean reading it off a padding slot for any short sequence."""
-    dataset = NextItemDataset([(0, [4, 5], 6)], max_length=5)
+    dataset = WindowDataset([([4, 5], 6)], max_length=5)
     sequence, target = dataset[0]
     assert sequence.tolist() == [PAD, PAD, PAD, 4, 5]
     assert sequence[-1].item() == 5, "the last slot must hold a real item"
@@ -163,24 +161,6 @@ def test_the_held_out_item_is_the_last_one():
         assert rows["timestamp"].iloc[0] == latest
 
 
-def test_training_sequences_never_contain_a_test_target():
-    """The check the whole evaluation rests on.
-
-    Valid here because the toy archive gives each user distinct items, as
-    MovieLens does; where a user can touch the same item twice, the held-out
-    interaction is what is held out, not the item.
-    """
-    interactions = toy()
-    held_out = {
-        (row.user_id, interactions.item_to_index[row.item_id])
-        for row in interactions.test.itertuples()
-    }
-    for user, history, target in training_sequences(interactions):
-        assert (user, target) not in held_out
-        for item in history:
-            assert (user, item) not in held_out
-
-
 def test_validation_split_steps_one_further_back():
     """`without_last` has to remove one more item, not re-use the test one."""
     interactions = toy()
@@ -197,240 +177,6 @@ def test_an_unknown_protocol_is_refused():
     with pytest.raises(ValueError, match="Unknown protocol"):
         Interactions(interactions.events, interactions.items,
                      protocol="whatever")
-
-
-# -------------------------------- the closed-form model and its recency
-def test_the_weight_matrix_has_a_zero_diagonal():
-    """Without the constraint the closed form is the identity, which explains
-    every item by itself and recommends nothing."""
-    weights = fit_ease(interaction_matrix(toy()), l2=10.0)
-    assert np.allclose(np.diag(weights), 0.0)
-
-
-def test_the_weight_matrix_is_square_over_the_catalogue():
-    interactions = toy()
-    weights = fit_ease(interaction_matrix(interactions), l2=10.0)
-    assert weights.shape == (interactions.n_items, interactions.n_items)
-
-
-def test_stronger_regularisation_shrinks_the_weights():
-    matrix = interaction_matrix(toy())
-    light = np.abs(fit_ease(matrix, l2=1.0)).sum()
-    heavy = np.abs(fit_ease(matrix, l2=1000.0)).sum()
-    assert heavy < light
-
-
-def test_the_most_recent_item_weighs_one():
-    profile = recency_profile([3, 5, 7], n_items=10, half_life=20.0)
-    assert profile[7] == pytest.approx(1.0)
-
-
-def test_weights_decay_towards_the_past():
-    profile = recency_profile([1, 2, 3, 4], n_items=10, half_life=2.0)
-    assert profile[4] > profile[3] > profile[2] > profile[1]
-
-
-def test_one_half_life_back_halves_the_weight():
-    profile = recency_profile([1, 2, 3], n_items=10, half_life=1.0)
-    assert profile[2] == pytest.approx(0.5)
-    assert profile[1] == pytest.approx(0.25)
-
-
-def test_no_half_life_reproduces_the_unordered_bag():
-    """The behaviour of plain EASE, which this model exists to improve on."""
-    profile = recency_profile([2, 5, 9], n_items=12, half_life=None)
-    assert set(np.flatnonzero(profile)) == {2, 5, 9}
-    assert np.allclose(profile[[2, 5, 9]], 1.0)
-
-
-def test_a_repeated_item_keeps_its_most_recent_weight():
-    """Summing instead would let a rewatched film outrank everything by
-    repetition rather than by relevance."""
-    profile = recency_profile([4, 1, 4], n_items=10, half_life=1.0)
-    assert profile[4] == pytest.approx(1.0)
-
-
-def test_an_empty_history_gives_an_empty_profile():
-    assert not recency_profile([], n_items=10, half_life=5.0).any()
-
-
-def test_scoring_a_user_with_no_history_returns_none():
-    """The cold start path takes over rather than this model inventing an
-    answer out of a zero vector."""
-    model = RecencyEASE(toy(), l2=10.0)
-    assert model.scores(user=0, history=[]) is None
-    assert model(0, [], k=5) == []
-
-
-def test_recommendations_exclude_the_history():
-    interactions = toy()
-    model = RecencyEASE(interactions, l2=10.0)
-    history = [1, 2, 3]
-    assert set(model(0, history, k=5)).isdisjoint(history)
-
-
-def two_taste_archive():
-    """Users who watch inside one of two genres, and never across.
-
-    Built so recency has something to say: a user who starts in one genre and
-    ends in the other should be recommended the genre they moved to.
-    """
-    import pandas as pd
-
-    from recsys.data import Interactions
-
-    left, right = list(range(1, 9)), list(range(9, 17))
-    rows, stamp = [], 0
-    for user in range(30):
-        block = left if user % 2 == 0 else right
-        for item in block:
-            stamp += 1
-            rows.append({"user_id": user, "item_id": item, "timestamp": stamp})
-
-    events = pd.DataFrame(rows)
-    items = pd.DataFrame({
-        "item_id": range(1, 17),
-        "title": [f"film {i}" for i in range(1, 17)],
-        "genres": ["A"] * 8 + ["B"] * 8,
-        "year": ["1990"] * 16,
-        "text": [f"film {i}" for i in range(1, 17)],
-    })
-    return Interactions(events, items, protocol="leave_one_out", min_history=2)
-
-
-def test_recency_moves_the_ranking_towards_the_recent_taste():
-    """A user who switched genres should be recommended what they switched to.
-
-    The unordered bag cannot express that, which is the whole reason the
-    recency weight exists.
-    """
-    interactions = two_taste_archive()
-    index = interactions.item_to_index
-    # Four films from the first genre, then four from the second.
-    history = [index[i] for i in (1, 2, 3, 4)] + [index[i] for i in (9, 10, 11, 12)]
-    second_genre = {index[i] for i in range(9, 17)}
-
-    bagged = RecencyEASE(interactions, l2=1.0, half_life=None)
-    recent = RecencyEASE(interactions, l2=1.0, half_life=1.0)
-
-    from_bag = bagged(999, history, k=4)
-    from_recent = recent(999, history, k=4)
-
-    share_bag = sum(i in second_genre for i in from_bag) / max(len(from_bag), 1)
-    share_recent = sum(i in second_genre for i in from_recent) / max(len(from_recent), 1)
-    assert share_recent >= share_bag
-    assert share_recent > 0.5, "the recent taste should dominate the top of the list"
-
-
-# --------------------------------------------- the two stages joined up
-N_ITEMS = 12
-
-
-class FakeGraph:
-    """A graph recommender whose opinion is fixed and known."""
-
-    def __init__(self, scores):
-        self.fixed = np.asarray(scores, dtype=np.float32)
-
-    def scores(self, user, history):
-        return self.fixed
-
-
-def build(beta, graph_scores=None):
-    graph = FakeGraph(graph_scores if graph_scores is not None
-                      else np.arange(N_ITEMS, dtype=np.float32))
-    content = np.zeros((N_ITEMS, 4), dtype=np.float32)
-    cold = ContentRecommender(content, popular=[1, 2, 3])
-    model = BERT4Rec(n_items=N_ITEMS, dimension=8, n_heads=2, n_layers=1,
-                     max_length=6).eval()
-    return TwoStageRecommender(graph, cold, model, alpha=1.0, beta=beta,
-                               n_candidates=5, max_length=6)
-
-
-def test_the_constructor_accepts_beta():
-    """Nothing else in the suite constructs the class, so this is what would
-    catch a keyword the constructor stops accepting."""
-    two_stage = build(beta=0.5)
-    assert two_stage.beta == 0.5
-
-
-def test_beta_zero_keeps_the_retrieval_order():
-    """With the sequence model given no weight, the output must be exactly
-    the retrieval ranking: beta has to reach all the way to zero."""
-    two_stage = build(beta=0.0)
-    history = [1, 2]
-    ranked = two_stage.recommend_many([(0, history, None)], k=3)[0]
-    assert ranked == two_stage.candidates(0, history)[:3]
-
-
-def test_beta_one_ignores_the_retrieval_order():
-    """At the other end the reranker decides alone, and the candidate set
-    still has to hold: it reorders, it does not fetch."""
-    torch.manual_seed(0)
-    two_stage = build(beta=1.0)
-    history = [1, 2]
-    candidates = two_stage.candidates(0, history)
-
-    ranked = two_stage.recommend_many([(0, history, None)], k=len(candidates))[0]
-    assert sorted(ranked) == sorted(candidates), "the candidate set is fixed"
-
-
-def test_the_output_is_always_a_subset_of_the_candidates():
-    two_stage = build(beta=0.5)
-    history = [1, 2]
-    candidates = set(two_stage.candidates(0, history))
-    ranked = two_stage.recommend_many([(0, history, None)], k=3)[0]
-    assert set(ranked) <= candidates
-
-
-def test_nothing_already_seen_is_recommended():
-    two_stage = build(beta=0.5)
-    history = [9, 10, 11]
-    ranked = two_stage.recommend_many([(0, history, None)], k=5)[0]
-    assert set(ranked).isdisjoint(history)
-
-
-def test_a_cold_user_falls_back_to_content():
-    """No user embedding means retrieval runs on content alone rather than
-    raising, which is the whole reason the cold start path exists."""
-    class ColdGraph:
-        def scores(self, user, history):
-            return None
-
-    content = np.zeros((N_ITEMS, 4), dtype=np.float32)
-    cold = ContentRecommender(content, popular=[4, 5, 6])
-    model = BERT4Rec(n_items=N_ITEMS, dimension=8, n_heads=2, n_layers=1,
-                     max_length=6).eval()
-    two_stage = TwoStageRecommender(ColdGraph(), cold, model, n_candidates=5,
-                                    max_length=6)
-
-    ranked = two_stage.recommend_many([(999, [], None)], k=3)[0]
-    assert len(ranked) == 3
-    assert 0 not in ranked
-
-
-def test_the_cold_object_has_to_be_a_content_recommender():
-    model = BERT4Rec(n_items=N_ITEMS, dimension=8, n_heads=2, n_layers=1,
-                     max_length=6).eval()
-    with pytest.raises(TypeError, match="ContentRecommender"):
-        TwoStageRecommender(FakeGraph(np.zeros(N_ITEMS)), object(), model)
-
-
-def test_standardise_puts_two_score_families_on_one_scale():
-    """Blending a dot product with a cosine without this makes alpha and beta
-    mean nothing."""
-    big = _standardise(np.array([100.0, 200.0, 300.0]))
-    small = _standardise(np.array([0.1, 0.2, 0.3]))
-    assert np.allclose(big, small, atol=1e-5)
-
-
-def test_retrieval_blend_returns_the_requested_number():
-    blend = RetrievalBlend(FakeGraph(np.arange(N_ITEMS, dtype=np.float32)),
-                           ContentRecommender(
-                               np.zeros((N_ITEMS, 4), dtype=np.float32),
-                               popular=[1, 2]),
-                           alpha=1.0, n_candidates=4)
-    assert len(blend(0, [1, 2])) == 4
 
 
 # ------------------------------------------- the catalogue-sized shortcuts
@@ -465,10 +211,10 @@ def test_the_sampled_loss_is_finite():
     a ranking, so nothing downstream complains.
     """
     interactions = toy(n_users=8, n_items=14, per_user=6)
-    sequences = training_sequences(interactions, max_length=6)
+    dataset = WindowDataset(FlatSequences(interactions, 6), max_length=6)
 
     model = train_bert4rec(
-        sequences, interactions.n_items, epochs=1, dimension=8, n_heads=2,
+        dataset, interactions.n_items, epochs=1, dimension=8, n_heads=2,
         n_layers=1, max_length=6, batch_size=4, n_negatives=4, verbose=False)
 
     assert all(torch.isfinite(p).all() for p in model.parameters())
@@ -477,7 +223,7 @@ def test_the_sampled_loss_is_finite():
 def test_a_non_finite_loss_stops_training():
     """Rather than returning a model whose every weight is NaN."""
     interactions = toy(n_users=6, n_items=12, per_user=5)
-    sequences = training_sequences(interactions, max_length=6)
+    dataset = WindowDataset(FlatSequences(interactions, 6), max_length=6)
 
     import recsys.models as models
 
@@ -490,7 +236,7 @@ def test_a_non_finite_loss_stops_training():
     models.nn.CrossEntropyLoss = lambda *a, **k: AlwaysNaN()
     try:
         with pytest.raises(RuntimeError, match="not finite"):
-            train_bert4rec(sequences, interactions.n_items, epochs=1,
+            train_bert4rec(dataset, interactions.n_items, epochs=1,
                            dimension=8, n_heads=2, n_layers=1, max_length=6,
                            batch_size=4, verbose=False)
     finally:
@@ -528,18 +274,16 @@ def test_retrieval_never_returns_padding_or_anything_seen():
 def test_the_flat_store_keeps_every_position_as_a_target():
     """Every item after the first is a target, with a bounded context window.
 
-    This is deliberately not what `training_sequences` does. That one cuts the
-    history down to `max_length` and then takes prefixes, so a user with more
-    interactions than the window loses their early targets entirely. Here the
-    window bounds what the model reads, not what it is asked to predict, and
-    the count below is what says which of the two is running.
+    The window bounds what the model reads, not what it is asked to predict.
+    Cutting the history to `max_length` first and only then taking prefixes
+    would silently drop the early targets of every long user, and nothing
+    downstream would say so.
     """
     interactions = toy(n_users=5, n_items=12, per_user=6)
     histories = interactions.indexed_histories()
 
     store = FlatSequences(interactions, max_length=4)
     assert len(store) == sum(len(h) - 1 for h in histories.values() if len(h) > 1)
-    assert len(store) > len(training_sequences(interactions, max_length=4))
 
     position = 0
     for history in histories.values():
@@ -550,3 +294,96 @@ def test_the_flat_store_keeps_every_position_as_a_target():
             assert list(window) == history[max(0, cut - 4):cut]
             assert target == history[cut]
             position += 1
+
+
+# --------------------------------------------- the two stages joined up
+def two_stage_fixture(n_items=14, n_candidates=5):
+    torch.manual_seed(0)
+    model = BERT4Rec(n_items=n_items, dimension=8, n_heads=2, n_layers=1,
+                     max_length=6).eval()
+    histories = [[1, 2, 3], [4, 5]]
+    candidates = np.array([[7, 8, 9, 10, 11], [2, 3, 6, 12, 13]])
+    # Descending, the way retrieval hands them over.
+    values = np.array([[5.0, 4.0, 3.0, 2.0, 1.0], [9.0, 7.0, 5.0, 3.0, 1.0]])
+    return model, histories, candidates, values
+
+
+def test_beta_zero_keeps_the_retrieval_order():
+    """With the sequence model given no weight, the output must be exactly the
+    retrieval ranking: beta has to reach all the way to zero."""
+    model, histories, candidates, values = two_stage_fixture()
+    ranked = rerank(model, histories, candidates, values, beta=0.0)
+    assert np.array_equal(ranked, candidates)
+
+
+def test_beta_one_still_returns_the_same_candidate_set():
+    """At the other end the reranker decides the order alone, and the
+    candidate set still has to hold: it reorders, it does not fetch."""
+    model, histories, candidates, values = two_stage_fixture()
+    ranked = rerank(model, histories, candidates, values, beta=1.0,
+                    max_length=6)
+
+    assert ranked.shape == candidates.shape
+    for row, original in zip(ranked, candidates):
+        assert sorted(row) == sorted(original)
+
+
+def test_reranking_never_invents_an_item():
+    """Whatever beta is, every row is a permutation of the row it was given.
+
+    This is the property that makes the second stage a refinement of the first
+    rather than a second retrieval, and the one the blend could break by
+    mixing scores that are not aligned with their candidates.
+    """
+    model, histories, candidates, values = two_stage_fixture()
+    for beta in (0.25, 0.5, 0.75):
+        ranked = rerank(model, histories, candidates, values,
+                        beta=beta, max_length=6)
+        for row, original in zip(ranked, candidates):
+            assert sorted(row) == sorted(original)
+            assert len(set(row)) == len(row)
+
+
+def test_standardising_puts_two_score_families_on_one_scale():
+    """A graph dot product and a transformer logit do not share a scale.
+
+    Added raw, beta would be meaningless: whichever family happened to have
+    the wider spread would decide the order on its own.
+    """
+    from recsys.large import standardise_rows
+
+    rows = np.array([[1.0, 2.0, 3.0], [1000.0, 2000.0, 3000.0]])
+    standardised = standardise_rows(rows)
+
+    assert np.allclose(standardised[0], standardised[1], atol=1e-5)
+    assert np.allclose(standardised.mean(axis=1), 0.0, atol=1e-6)
+    assert np.allclose(standardised.std(axis=1), 1.0, atol=1e-5)
+
+
+def test_a_flat_row_of_scores_does_not_divide_by_zero():
+    from recsys.large import standardise_rows
+
+    assert np.isfinite(standardise_rows(np.full((2, 4), 3.0))).all()
+
+
+def test_scoring_a_ranking_counts_hits_positions_and_coverage():
+    """recall, NDCG and coverage in one pass over the same rows.
+
+    NDCG has to fall with the rank of the hit; recall must not. A hit at one
+    and a hit at ten are the same event to recall and different events to
+    NDCG, which is the reason both are reported.
+    """
+    from recsys.large import score_ranked
+
+    ranked = [[5, 6, 7], [8, 9, 10], [11, 12, 13]]
+    targets = [5, 10, 99]  # first, last, missing
+
+    result, hits = score_ranked(ranked, targets, k=3, catalogue_size=20)
+
+    assert hits == [1.0, 1.0, 0.0]
+    assert result["recall@3"] == pytest.approx(2 / 3)
+    assert result["evaluated"] == 3
+    assert result["distinct_items_recommended"] == 9
+    assert result["catalogue_coverage"] == pytest.approx(9 / 20)
+    # 1/log2(2) for the hit at rank 1, 1/log2(4) for the one at rank 3.
+    assert result["ndcg@3"] == pytest.approx((1.0 + 0.5) / 3)

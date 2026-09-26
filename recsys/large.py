@@ -1,22 +1,23 @@
 """Retrieval and reranking that never build a users-by-items array.
 
-The MovieLens path scores one user at a time in numpy, which is clear and
-costs nothing at 1,682 items. At 162,000 items and 20,000 evaluation users the
-same loop would ask for 13 GB of scores and take an hour of Python.
+Scoring one user at a time in numpy is the clear way to write this, and at a
+few thousand items it costs nothing. At 162,000 items and 20,000 evaluation
+users the same loop asks for 13 GB of scores and takes an hour of Python.
 
-So the two hot parts are done differently here. Retrieval multiplies a block
+So the two hot parts are done differently. Retrieval multiplies a block
 of users against the whole item table on the GPU and takes the top k of each
 row before the block is released, so the largest array alive is one block.
 Reranking scores only those k columns, which is what `score_sequences` does
 when it is given candidates.
 
-Nothing in this module is specific to Amazon. It is specific to a catalogue
-too large to hold a dense score matrix for.
+Nothing here is specific to Amazon. It is specific to a catalogue too large to
+hold a dense score matrix for.
 """
 import numpy as np
 import torch
 
 from .data import PAD
+from .metrics import ndcg_at_k, recall_at_k
 from .models import score_sequences
 
 NEG = float("-inf")
@@ -104,12 +105,8 @@ def score_ranked(ranked, targets, k=10, catalogue_size=None):
     for row, target in zip(ranked, targets):
         top = list(row[:k])
         seen.update(top)
-        if target in top:
-            hits.append(1.0)
-            gains.append(1.0 / np.log2(top.index(target) + 2))
-        else:
-            hits.append(0.0)
-            gains.append(0.0)
+        hits.append(recall_at_k(top, target, k))
+        gains.append(ndcg_at_k(top, target, k))
 
     result = {
         f"recall@{k}": float(np.mean(hits)) if hits else 0.0,
@@ -131,16 +128,6 @@ def popularity_ranked(popular, histories, k=10):
         rows.append([i for i in popular if i not in seen][:k])
     return rows
 
-
-def ease_memory(n_items, dtype_bytes=8):
-    """What the closed-form model would need, in bytes.
-
-    Reported rather than attempted above a certain size: the Gram matrix, the
-    inverse, and the LAPACK workspace are each the square of the catalogue.
-    """
-    gram = n_items * n_items * dtype_bytes
-    return {"gram_bytes": gram, "needed_bytes": 2 * gram,
-            "gram_gib": gram / 2**30, "needed_gib": 2 * gram / 2**30}
 
 
 @torch.no_grad()

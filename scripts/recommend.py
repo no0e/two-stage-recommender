@@ -1,22 +1,17 @@
-"""Recommend ten films for one user, and show what they actually watched next.
+"""Recommend ten items for one user, and show what they actually bought next.
 
-    python scripts/recommend.py --user 42
-    python scripts/recommend.py --user 42 --rerank
+    python scripts/recommend.py
+    python scripts/recommend.py --category Video_Games --user 12 --rerank
 
-The retrieval stage alone takes a second or two on a laptop: one matrix inverse
-over the item-item matrix, then the user's history weighted towards what they
-did most recently. That is the default, and it is enough to see the system
-answer.
+The retrieval stage has to be trained before it can answer, which is a few
+minutes on a GPU and longer on a CPU. It is trained once and the embeddings
+are cached under data/, so every run after the first is immediate.
 
-`--rerank` adds the second stage, which trains BERT4Rec first and so takes a
-few minutes on a CPU. It then prints the reranked ten under the retrieved
-ten, which is the clearest picture of what the second stage changes.
-
-The last film of every user is held out, so the one they really watched next is
-known and printed underneath. It lands in the top ten about 18% of the time.
+The 5-core files carry interactions, not product names, so items come out as
+their ASIN with the link that resolves it. The last item of every user is held
+out, so the one they really bought next is known and printed underneath.
 """
 import argparse
-import json
 import sys
 import time
 from pathlib import Path
@@ -24,112 +19,146 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from recsys.data import load, training_sequences  # noqa: E402
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
+
+from recsys.amazon import CATEGORIES, FlatSequences, load_amazon  # noqa: E402
+from recsys.large import rerank, retrieve  # noqa: E402
 from recsys.models import (  # noqa: E402
-    ContentRecommender, RecencyEASE, build_content_matrix, popularity,
-    train_bert4rec,
+    WindowDataset, train_bert4rec, train_lightgcn,
 )
-from recsys.pipeline import TwoStageRecommender  # noqa: E402
 
-FITTED = ROOT / "docs" / "results.json"
-
-
-def titles(interactions):
-    """Item index to title, so the output reads as films and not integers."""
-    lookup = interactions.items.set_index("item_id")["title"].to_dict()
-    return {
-        index: lookup.get(item_id, f"item {item_id}")
-        for index, item_id in interactions.index_to_item.items()
-    }
+LINK = "https://www.amazon.com/dp/{}"
 
 
-def fitted_weights():
-    """alpha and beta as the last full evaluation chose them.
+def embeddings(interactions, category, args, device):
+    """The trained retrieval stage, from cache when there is one."""
+    cache = Path(args.data or ROOT / "data") / f"lightgcn_{category}.npz"
+    if cache.exists() and not args.retrain:
+        stored = np.load(cache)
+        if stored["users"].shape[0] == interactions.n_users:
+            print(f"Loaded the retrieval stage from {cache.name}.")
+            return stored["users"], stored["items"]
+        print(f"{cache.name} was fitted on a different split; refitting.")
 
-    Read from the results file rather than written in here, so the demo cannot
-    quietly use different weights from the ones the table reports.
-    """
-    if FITTED.exists():
-        saved = json.loads(FITTED.read_text(encoding="utf-8"))
-        return saved.get("alpha", 1.0), saved.get("beta", 0.5)
-    return 1.0, 0.5
+    print(f"Training LightGCN on {len(interactions.train):,} interactions, "
+          f"{args.epochs} epochs on {device} ...")
+    started = time.time()
+    user_vectors, item_vectors = train_lightgcn(
+        interactions, epochs=args.epochs, dimension=args.dimension,
+        n_layers=args.layers, batch_size=args.batch, device=device,
+        verbose=True)
+    print(f"  fitted in {time.time() - started:.0f}s")
+
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(cache, users=user_vectors, items=item_vectors)
+    print(f"  cached in {cache.name}; the next run will not retrain.")
+    return user_vectors, item_vectors
 
 
-def show(name, ranked, title_of, target):
+def pick_user(interactions, wanted, min_history=8):
+    """The user asked for, or the first held-out one with a real history."""
+    histories = interactions.indexed_histories()
+    if wanted is not None:
+        history = histories.get(wanted)
+        if not history:
+            known = sorted(histories)
+            raise SystemExit(
+                f"No history for user {wanted}. This category has users "
+                f"{known[0]} to {known[-1]}."
+            )
+        return wanted, history
+
+    for user in interactions.test["user_id"]:
+        history = histories.get(int(user))
+        if history and len(history) >= min_history:
+            return int(user), history
+    raise SystemExit("No held-out user has a history worth showing.")
+
+
+def show(name, ranked, asin_of, target):
     print(f"\n{name}")
     for rank, index in enumerate(ranked, start=1):
-        marker = "  <- the one they watched" if index == target else ""
-        print(f"  {rank:>2}  {title_of.get(index, index)}{marker}")
+        asin = asin_of[int(index)]
+        mark = "   <- the one they bought" if int(index) == int(target) else ""
+        print(f"  {rank:>2}  {asin}  {LINK.format(asin)}{mark}")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--user", type=int, default=12)
+    parser.add_argument("--category", default="Video_Games",
+                        choices=sorted(CATEGORIES))
+    parser.add_argument("--user", type=int, default=None)
     parser.add_argument("--k", type=int, default=10)
+    parser.add_argument("--candidates", type=int, default=100)
     parser.add_argument("--data", default=None)
+    parser.add_argument("--epochs", type=int, default=400)
+    parser.add_argument("--dimension", type=int, default=64)
+    parser.add_argument("--layers", type=int, default=3)
+    parser.add_argument("--batch", type=int, default=500_000)
+    parser.add_argument("--retrain", action="store_true")
     parser.add_argument("--rerank", action="store_true",
                         help="Add the second stage. Trains BERT4Rec first.")
-    parser.add_argument("--bert-epochs", type=int, default=30)
+    parser.add_argument("--bert-epochs", type=int, default=8)
+    parser.add_argument("--beta", type=float, default=0.75,
+                        help="Fitted at 0.75 on both categories.")
+    parser.add_argument("--max-length", type=int, default=50)
     parser.add_argument("--device", default=None)
     args = parser.parse_args()
 
-    interactions = load(args.data)
-    title_of = titles(interactions)
-    histories = interactions.indexed_histories()
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    interactions = load_amazon(args.category, args.data)
+    asin_of = {index: interactions.items["asin"].iloc[item]
+               for item, index in interactions.item_to_index.items()}
 
-    history = histories.get(args.user)
-    if not history:
-        known = sorted(histories)
-        raise SystemExit(
-            f"No history for user {args.user}. This dataset has users "
-            f"{known[0]} to {known[-1]}."
-        )
+    print(f"{args.category.replace('_', ' ')}: "
+          f"{interactions.n_users:,} users, "
+          f"{interactions.n_items - 1:,} items, "
+          f"{len(interactions.events):,} interactions.")
 
-    held_out = interactions.test[interactions.test["user_id"] == args.user]
+    user, history = pick_user(interactions, args.user)
+    index = interactions.user_to_index[user]
+
+    held_out = interactions.test[interactions.test["user_id"] == user]
     target = (interactions.item_to_index.get(held_out["item_id"].iloc[0])
               if len(held_out) else None)
 
-    print(f"MovieLens 100k: {interactions.n_users:,} users, "
-          f"{interactions.n_items - 1:,} films.")
-    print(f"\nUser {args.user}, last five of {len(history)} films watched")
-    for index in history[-5:]:
-        print(f"      {title_of.get(index, index)}")
+    user_vectors, item_vectors = embeddings(
+        interactions, args.category, args, device)
 
-    started = time.time()
-    ease = RecencyEASE(interactions)
-    print(f"\nRetrieval stage fitted in {time.time() - started:.1f}s.")
+    print(f"\nUser {user}, last five of {len(history)} items bought")
+    for item in history[-5:]:
+        print(f"      {asin_of[int(item)]}")
 
-    retrieved = ease(args.user, history, k=args.k)
-    show(f"Top {args.k}, retrieval only", retrieved, title_of, target)
+    candidates, values = retrieve(
+        user_vectors, item_vectors, [index], [history],
+        k=args.candidates if args.rerank else args.k, device=device)
+    show(f"Top {args.k}, retrieval only", candidates[0][:args.k], asin_of,
+         target)
 
     if args.rerank:
-        import torch
-
-        device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-        alpha, beta = fitted_weights()
-        print(f"\nTraining the reranker on {device}, alpha={alpha}, "
-              f"beta={beta} ...")
-
+        print(f"\nTraining the reranker on {device}, beta={args.beta} ...")
         started = time.time()
+        store = FlatSequences(interactions, args.max_length)
         model = train_bert4rec(
-            training_sequences(interactions), interactions.n_items,
-            epochs=args.bert_epochs, device=device, verbose=False)
+            WindowDataset(store, args.max_length), interactions.n_items,
+            epochs=args.bert_epochs, max_length=args.max_length,
+            batch_size=1024, n_negatives=2048, workers=4, device=device,
+            verbose=True)
         print(f"  BERT4Rec in {time.time() - started:.0f}s")
 
-        popular = popularity(interactions)
-        two_stage = TwoStageRecommender(
-            ease, ContentRecommender(build_content_matrix(interactions),
-                                     popular),
-            model, alpha=alpha, beta=beta, device=device)
-        show(f"Top {args.k}, both stages", two_stage(args.user, history, args.k),
-             title_of, target)
+        reranked = rerank(model, [history], candidates, values,
+                          beta=args.beta, max_length=args.max_length,
+                          device=device)
+        show(f"Top {args.k}, both stages", reranked[0][:args.k], asin_of,
+             target)
 
     if target is None:
         print("\nThis user has nothing held out.")
     else:
-        print(f"\nThey actually watched: {title_of.get(target, target)}")
-        print("It lands in the top ten for about 18% of users; "
-              "recall@10 over all 943 is 0.176.")
+        print(f"\nThey actually bought: {asin_of[int(target)]}")
+        print("It lands in the top ten for about 9% of users on Video Games; "
+              "recall@10 over 20,000 of them is 0.0860.")
 
 
 if __name__ == "__main__":

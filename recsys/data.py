@@ -1,34 +1,21 @@
-"""Loading interactions, splitting them in time, and turning them into sequences.
-
-The competition this was built for used a private Amazon dataset that is not
-redistributable, so the public version runs on MovieLens, which has the same
-shape: interactions with a timestamp, and items with a title and categories to
-build content features from.
+"""Interactions, their split, and the index maps that go with them.
 
 One decision here is load-bearing. Index 0 is reserved as padding and never
 belongs to an item, so items are numbered from 1. Mapping an unknown item to 0
-is then safe: it lands on a slot that is masked in the sequence model and
-excluded from every ranking, rather than on whichever real item sorts first.
+is then safe: it lands on a slot the sequence model masks and every ranking
+excludes, rather than on whichever real item sorts first.
+
+The catalogues this runs on are Amazon categories, loaded by `recsys.amazon`.
+Nothing in this module knows that; it takes a frame of timestamped
+(user, item) events and a frame of items.
 """
 from pathlib import Path
-
-import pandas as pd
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
 PAD = 0
 """Reserved index. Real items start at 1, so a padded slot can never be
 mistaken for an interaction."""
-
-MIN_POSITIVE_RATING = 1
-"""The rating at which an interaction counts as a positive.
-
-One, meaning every interaction counts. The competition this system was built
-for had implicit data with no ratings at all: a user touched an item or they
-did not. Thresholding MovieLens at four stars adds a filter the original task
-never had, and throws away 45% of the graph's edges while it does so. Raise it
-with `--min-rating` to get the stricter version, which the sequential
-recommendation literature often reports on."""
 
 
 class Interactions:
@@ -175,68 +162,3 @@ class Interactions:
                 set(self.test["user_id"]) - set(self.train["user_id"])
             ),
         }
-
-
-def training_sequences(interactions, max_length=50):
-    """Every prefix of every training history, paired with the next item.
-
-    One interaction becomes many examples: a user with ten items gives nine
-    (prefix, next) pairs. That is what makes a sequential model trainable on a
-    dataset this size.
-    """
-    sequences = []
-    for user, history in interactions.indexed_histories().items():
-        history = history[-max_length:]
-        for cut in range(1, len(history)):
-            sequences.append((user, history[:cut], history[cut]))
-    return sequences
-
-
-def load_movielens(data_dir=None, min_rating=MIN_POSITIVE_RATING):
-    """MovieLens 100k, as implicit feedback.
-
-    Ratings at or above `min_rating` are kept. At the default of one that is
-    every interaction, which is the shape the competition data had.
-    """
-    root = Path(data_dir or DATA_DIR) / "ml-100k"
-    if not root.exists():
-        raise FileNotFoundError(
-            f"{root} is missing. Run scripts/fetch_data.py first."
-        )
-
-    events = pd.read_csv(
-        root / "u.data", sep="\t",
-        names=["user_id", "item_id", "rating", "timestamp"],
-    )
-    events = events[events["rating"] >= min_rating].drop(columns="rating")
-
-    genres = [
-        "unknown", "Action", "Adventure", "Animation", "Children", "Comedy",
-        "Crime", "Documentary", "Drama", "Fantasy", "Film-Noir", "Horror",
-        "Musical", "Mystery", "Romance", "Sci-Fi", "Thriller", "War", "Western",
-    ]
-    items = pd.read_csv(
-        root / "u.item", sep="|", encoding="latin-1", header=None,
-        names=["item_id", "title", "released", "video", "url"] + genres,
-    )
-    items["genres"] = items[genres].apply(
-        lambda row: " ".join(g for g, flag in zip(genres, row) if flag == 1),
-        axis=1,
-    )
-    items["year"] = (
-        items["released"].astype(str).str.extract(r"(\d{4})")[0]
-        .fillna("").astype(str)
-    )
-    # The text the content model reads. Nothing here comes from the
-    # interactions, which is what lets it score an item with no history.
-    items["text"] = (
-        items["title"].fillna("") + " " + items["genres"] + " " + items["year"]
-    )
-    return events, items[["item_id", "title", "genres", "year", "text"]]
-
-
-def load(data_dir=None, protocol="leave_one_out", test_quantile=0.8,
-         min_rating=MIN_POSITIVE_RATING):
-    events, items = load_movielens(data_dir, min_rating=min_rating)
-    return Interactions(
-        events, items, protocol=protocol, test_quantile=test_quantile)

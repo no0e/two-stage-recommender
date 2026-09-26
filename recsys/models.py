@@ -1,71 +1,27 @@
-"""The four models, in the order the pipeline uses them.
+"""The two models the pipeline runs, in the order it runs them.
 
-`build_content_matrix` and `ContentRecommender` turn a title and its genres into
-a vector, which is the only path that can score an item nobody has touched.
-
-`RecencyEASE` solves for an item-item weight matrix in a single matrix inverse,
-then scores a user by their history weighted towards what they did most
-recently. It is the retrieval stage, and it fits in about a second.
-
-`train_lightgcn` is the graph alternative to that retrieval, propagating user
-and item embeddings over a normalised sparse adjacency. `torch_geometric` is not
-a dependency: the propagation is one sparse matrix multiply per layer.
+`train_lightgcn` is the retrieval stage. User and item embeddings are smoothed
+over the interaction graph by a normalised sparse adjacency, one matrix
+multiply per layer. `torch_geometric` is not a dependency: a graph library
+would have bought a single line and cost an install that frequently fails.
 
 `train_bert4rec` is the reranking stage: a small transformer over the user's
-sequence, which is the only model here that knows what follows what.
+sequence, which is the only model here that knows what follows what. It scores
+a handful of candidates rather than the catalogue, and trains against a sampled
+softmax, because at 162,035 items the output layer is otherwise the whole cost
+of a step.
 """
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.preprocessing import normalize
 from torch.utils.data import DataLoader, Dataset
 
 from .data import PAD
 
 
-# -------------------------------------------------------------- content
-def tfidf_features(texts, max_features=4096):
-    matrix = TfidfVectorizer(
-        max_features=max_features, stop_words="english", sublinear_tf=True,
-    ).fit_transform(texts)
-    return normalize(np.asarray(matrix.todense(), dtype=np.float32))
-
-
-def sbert_features(texts, model_name="all-MiniLM-L6-v2"):
-    """Sentence embeddings. Optional: the import is deliberately local."""
-    from sentence_transformers import SentenceTransformer
-
-    model = SentenceTransformer(model_name, device="cpu")
-    embeddings = model.encode(
-        list(texts), batch_size=256, show_progress_bar=False)
-    return normalize(np.asarray(embeddings, dtype=np.float32))
-
-
-def build_content_matrix(interactions, encoder="tfidf"):
-    """One row per item index, aligned with `item_to_index`, PAD row at zero.
-
-    Rows are L2 normalised, so a dot product between two of them is a cosine
-    similarity and the scoring code never has to normalise again.
-    """
-    items = interactions.items.copy()
-    items["index"] = items["item_id"].map(interactions.item_to_index)
-    items = items[items["index"].notna()].sort_values("index")
-
-    texts = items["text"].fillna("").tolist()
-    features = (
-        sbert_features(texts) if encoder == "sbert" else tfidf_features(texts)
-    )
-
-    matrix = np.zeros((interactions.n_items, features.shape[1]),
-                      dtype=np.float32)
-    matrix[items["index"].to_numpy(dtype=int)] = features
-    return matrix  # row PAD stays zero, so it scores zero against everything
-
-
 def popularity(interactions, top=500):
-    """Item indices by training frequency. The fallback of last resort."""
+    """Item indices by training frequency. The baseline, and the last resort."""
     counts = interactions.train["item_id"].value_counts()
     ranked = [
         interactions.item_to_index[item]
@@ -74,146 +30,7 @@ def popularity(interactions, top=500):
     return ranked[:top]
 
 
-class ContentRecommender:
-    """Cold start: score by similarity to what the user has already liked.
-
-    With no history at all there is nothing to be similar to, and the honest
-    answer is the popular list rather than an arbitrary ranking dressed up as a
-    personalised one.
-    """
-
-    def __init__(self, content_matrix, popular):
-        self.content = content_matrix
-        self.popular = popular
-
-    def user_profile(self, history):
-        """The mean of the content rows of what the user has seen."""
-        history = [i for i in history if i != PAD]
-        if not history:
-            return None
-        profile = self.content[history].mean(axis=0)
-        norm = np.linalg.norm(profile)
-        return profile / norm if norm > 0 else None
-
-    def scores(self, history):
-        profile = self.user_profile(history)
-        if profile is None:
-            scores = np.zeros(len(self.content), dtype=np.float32)
-            # Descending so the most popular item keeps the highest score.
-            for rank, index in enumerate(self.popular):
-                scores[index] = 1.0 - rank / max(len(self.popular), 1)
-            return scores
-        return self.content @ profile
-
-    def recommend(self, history, k=10):
-        scores = self.scores(history)
-        seen = set(history)
-        order = np.argsort(-scores)
-        out = []
-        for index in order:
-            if index == PAD or index in seen:
-                continue
-            out.append(int(index))
-            if len(out) == k:
-                break
-        return out
-
-
-# -------------------------------------- the closed-form retrieval model
-def interaction_matrix(interactions, frame=None):
-    """Users by items, one where the interaction happened."""
-    frame = interactions.train if frame is None else frame
-    rows = frame["user_id"].map(interactions.user_to_index)
-    columns = frame["item_id"].map(interactions.item_to_index)
-    keep = rows.notna() & columns.notna()
-
-    matrix = np.zeros(
-        (interactions.n_users, interactions.n_items), dtype=np.float32)
-    matrix[rows[keep].to_numpy(int), columns[keep].to_numpy(int)] = 1.0
-    return matrix
-
-
-def fit_ease(matrix, l2=100.0):
-    """The EASE weight matrix: B = -P / diag(P), zero on the diagonal.
-
-    The zero diagonal is the whole trick. Without it the closed-form solution
-    is the identity, which reconstructs each item from itself perfectly and
-    recommends nothing. Constraining it to zero forces every item to be
-    explained by the others, and `l2` is what stops that explanation from
-    memorising the training matrix.
-    """
-    gram = (matrix.T @ matrix).astype(np.float64)
-    np.fill_diagonal(gram, np.diag(gram) + l2)
-
-    precision = np.linalg.inv(gram)
-    weights = -precision / np.diag(precision)
-    np.fill_diagonal(weights, 0.0)
-    return weights.astype(np.float32)
-
-
-def recency_profile(history, n_items, half_life=20.0):
-    """The user vector to score with, weighted towards recent items.
-
-    The last item weighs one and the weight halves every `half_life` steps
-    back. `half_life=None` gives the unordered bag, which is what plain EASE
-    uses and what this exists to improve on.
-    """
-    profile = np.zeros(n_items, dtype=np.float32)
-    if not len(history):
-        return profile
-    if half_life is None:
-        profile[list(history)] = 1.0
-        return profile
-
-    positions = np.arange(len(history))
-    ages = (len(history) - 1) - positions
-    weights = np.power(0.5, ages / float(half_life)).astype(np.float32)
-    # An item seen more than once keeps its most recent weight, not the sum,
-    # so a rewatched film does not outrank everything by repetition alone.
-    np.maximum.at(profile, np.asarray(history, dtype=int), weights)
-    return profile
-
-
-class RecencyEASE:
-    """Retrieval by item-item weights over a recency-weighted profile.
-
-    Scores from the history alone and never looks the user up, so a user the
-    model has never seen is handled by the same code path as everyone else,
-    provided they have done something. That is one fewer special case than the
-    graph model needs.
-    """
-
-    def __init__(self, interactions, l2=100.0, half_life=20.0):
-        self.interactions = interactions
-        self.half_life = half_life
-        self.weights = fit_ease(interaction_matrix(interactions), l2=l2)
-
-    def scores(self, user, history):
-        if not len(history):
-            return None  # nothing to be similar to; the cold path takes over
-        profile = recency_profile(
-            history, self.interactions.n_items, self.half_life)
-        return profile @ self.weights
-
-    def __call__(self, user, history, k=100):
-        from .pipeline import _top
-
-        scores = self.scores(user, history)
-        if scores is None:
-            return []
-        return _top(scores, history, k)
-
-    def recommend_many(self, triples, k=100):
-        from .pipeline import _top
-
-        out = []
-        for user, history, _ in triples:
-            scores = self.scores(user, history)
-            out.append([] if scores is None else _top(scores, history, k))
-        return out
-
-
-# -------------------------------------------- LightGCN, the alternative
+# ------------------------------------------ LightGCN, the first stage
 def build_adjacency(interactions, device="cpu"):
     """The symmetric, degree-normalised user-item graph as a sparse tensor.
 
@@ -379,33 +196,12 @@ def train_lightgcn(interactions, epochs=300, dimension=64, n_layers=3,
 
 
 # ---------------------------------------- BERT4Rec, the reranking stage
-class NextItemDataset(Dataset):
-    """(padded history, next item), with the padding on the left."""
-
-    def __init__(self, sequences, max_length=50):
-        self.sequences = sequences
-        self.max_length = max_length
-
-    def __len__(self):
-        return len(self.sequences)
-
-    def __getitem__(self, index):
-        _, history, target = self.sequences[index]
-        history = history[-self.max_length:]
-        padding = [PAD] * (self.max_length - len(history))
-        return (
-            torch.tensor(padding + history, dtype=torch.long),
-            torch.tensor(target, dtype=torch.long),
-        )
-
-
 class WindowDataset(Dataset):
     """Pads whatever a source yields as (window, target) to a fixed length.
 
-    `NextItemDataset` holds a list of (user, history, target) triples, which
-    is fine when the histories are copied once. The flat store in
-    `recsys.amazon` hands out a numpy view instead, and this is what turns
-    either of them into a padded tensor.
+    The flat store in `recsys.amazon` hands out a numpy view into one shared
+    array rather than a copied list, and this is what turns it into the padded
+    tensor the model reads.
     """
 
     def __init__(self, source, max_length=50):
@@ -482,10 +278,10 @@ class BERT4Rec(nn.Module):
         return scores.masked_fill(candidates == PAD, float("-inf"))
 
 
-def train_bert4rec(sequences, n_items, epochs=20, dimension=128, n_heads=4,
+def train_bert4rec(dataset, n_items, epochs=20, dimension=128, n_heads=4,
                    n_layers=2, max_length=50, batch_size=128,
                    learning_rate=1e-3, device="cpu", seed=0, verbose=True,
-                   n_negatives=None, dataset=None, workers=0):
+                   n_negatives=None, workers=0):
     """Fit the reranker.
 
     `n_negatives` turns the loss into a sampled softmax: the target is scored
@@ -501,8 +297,6 @@ def train_bert4rec(sequences, n_items, epochs=20, dimension=128, n_heads=4,
     """
     torch.manual_seed(seed)
     model = BERT4Rec(n_items, dimension, n_heads, n_layers, max_length).to(device)
-    if dataset is None:
-        dataset = NextItemDataset(sequences, max_length)
     loader = DataLoader(
         dataset, batch_size=batch_size, shuffle=True, num_workers=workers,
         pin_memory=(workers > 0 and device != "cpu"),

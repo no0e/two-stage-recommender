@@ -1,18 +1,14 @@
-"""Train every system and measure them against each other and against popularity.
+"""LightGCN retrieval and BERT4Rec reranking on an Amazon category.
 
-    python scripts/evaluate.py
-    python scripts/evaluate.py --bert-epochs 5        # a quick pass
+    python scripts/evaluate.py --category Video_Games
+    python scripts/evaluate.py --category Toys_and_Games
 
-Every system is scored on the same evaluation triples, so the comparisons are
-paired and the intervals mean something. Every hyperparameter is fitted on a
-split taken one step further back than the test split, using models that never
-saw a test target, and the test set is touched once at the end.
+Trains both stages, scores them against each other and against popularity on
+the same held-out users, and writes docs/amazon_<category>.json. Once both
+categories have been run it redraws docs/results.png from the pair.
 
-On Windows, set OMP_NUM_THREADS=1 before running. Some BLAS builds deadlock on
-matrix inversions above roughly 800 by 800, which is smaller than the item-item
-matrix this fits.
-
-Writes docs/results.json and redraws docs/results.png from it.
+Every weight is fitted on a split taken one step further back, with models
+retrained without those targets, and the test set is touched once at the end.
 """
 import argparse
 import json
@@ -25,162 +21,181 @@ sys.path.insert(0, str(ROOT))
 
 import torch  # noqa: E402
 
-from recsys.data import load, training_sequences  # noqa: E402
-from recsys.metrics import bootstrap_difference, evaluate, hits  # noqa: E402
+from recsys.amazon import (  # noqa: E402
+    CATEGORIES, FlatSequences, evaluation_sample, load_amazon,
+)
+from recsys.large import (  # noqa: E402
+    popularity_ranked, rerank, retrieve, score_ranked, sequential_topk,
+)
+from recsys.metrics import bootstrap_difference  # noqa: E402
+from recsys.plotting import figure_from_docs  # noqa: E402
 from recsys.models import (  # noqa: E402
-    ContentRecommender, RecencyEASE, build_content_matrix, popularity,
-    train_bert4rec, train_lightgcn,
+    WindowDataset, popularity, train_bert4rec, train_lightgcn,
 )
-from recsys.pipeline import (  # noqa: E402
-    GraphRecommender, PopularityRecommender, RetrievalBlend,
-    SequentialRecommender, TwoStageRecommender, fit_alpha_on_retrieval, fit_beta,
-)
-from recsys.plotting import results_figure  # noqa: E402
 
 
 def parse():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--category", default="Toys_and_Games",
+                        choices=sorted(CATEGORIES))
     parser.add_argument("--data", default=None)
-    parser.add_argument("--protocol", default="leave_one_out",
-                        choices=["leave_one_out", "temporal"])
     parser.add_argument("--k", type=int, default=10)
-    parser.add_argument("--encoder", default="tfidf", choices=["tfidf", "sbert"])
-    parser.add_argument("--min-rating", type=int, default=1)
-    parser.add_argument("--lightgcn-epochs", type=int, default=300)
-    parser.add_argument("--dimension", type=int, default=256)
-    parser.add_argument("--layers", type=int, default=1)
-    parser.add_argument("--l2", type=float, default=100.0,
-                        help="EASE regularisation, chosen on validation.")
-    parser.add_argument("--half-life", type=float, default=20.0,
-                        help="Recency half life, in interactions.")
-    parser.add_argument("--bert-epochs", type=int, default=30)
     parser.add_argument("--candidates", type=int, default=100)
+    parser.add_argument("--eval-users", type=int, default=20_000)
+    parser.add_argument("--max-users", type=int, default=None,
+                        help="Subsample users. For smoke tests.")
+
+    parser.add_argument("--dimension", type=int, default=64)
+    parser.add_argument("--layers", type=int, default=3)
+    parser.add_argument("--lightgcn-epochs", type=int, default=400)
+    parser.add_argument("--lightgcn-batch", type=int, default=500_000)
+
+    parser.add_argument("--bert-epochs", type=int, default=10)
+    parser.add_argument("--bert-batch", type=int, default=512)
+    parser.add_argument("--negatives", type=int, default=2048,
+                        help="Sampled-softmax negatives. 0 uses the full one.")
     parser.add_argument("--max-length", type=int, default=50)
+    parser.add_argument("--workers", type=int, default=8)
+
     parser.add_argument("--device", default=None)
-    parser.add_argument("--out", default=str(ROOT / "docs" / "results.json"))
+    parser.add_argument("--out", default=None)
     return parser.parse_args()
+
+
+def train_both(interactions, args, device, label):
+    """The two models, on whichever split is handed in."""
+    print(f"\n[{label}] LightGCN: {interactions.n_users:,} users, "
+          f"{interactions.n_items - 1:,} items, "
+          f"{len(interactions.train):,} training events")
+    started = time.time()
+    user_vectors, item_vectors = train_lightgcn(
+        interactions, epochs=args.lightgcn_epochs, dimension=args.dimension,
+        n_layers=args.layers, batch_size=args.lightgcn_batch, device=device,
+        verbose=True)
+    print(f"[{label}] LightGCN in {time.time() - started:.0f}s")
+
+    store = FlatSequences(interactions, args.max_length)
+    print(f"[{label}] BERT4Rec: {len(store):,} training sequences, "
+          f"{store.nbytes() / 2 ** 20:.0f} MiB of index")
+    started = time.time()
+    model = train_bert4rec(
+        WindowDataset(store, args.max_length), interactions.n_items,
+        epochs=args.bert_epochs, max_length=args.max_length,
+        batch_size=args.bert_batch, n_negatives=args.negatives or None,
+        workers=args.workers, device=device, verbose=True)
+    print(f"[{label}] BERT4Rec in {time.time() - started:.0f}s")
+    return user_vectors, item_vectors, model
 
 
 def main():
     args = parse()
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     started = time.time()
+    recall_key = f"recall@{args.k}"
+    ndcg_key = f"ndcg@{args.k}"
 
-    interactions = load(args.data, protocol=args.protocol,
-                        min_rating=args.min_rating)
+    interactions = load_amazon(args.category, args.data,
+                               max_users=args.max_users)
+    n_items = interactions.n_items - 1
     print(json.dumps(interactions.summary(), indent=2))
-    print(f"\nDevice: {device}\n")
+    print(f"\nDevice: {device}")
 
+    # --------------------------------------------------------- validation
     validation = interactions.without_last(1)
-    validation_pairs = validation.evaluation_pairs()
+    val_users, val_histories, val_targets = evaluation_sample(
+        validation, args.eval_users, seed=1)
+    print(f"\nValidation: {len(val_users):,} users")
 
-    print("Fitting the retrieval models ...")
-    t = time.time()
-    ease = RecencyEASE(interactions, l2=args.l2, half_life=args.half_life)
-    print(f"  EASE in {time.time() - t:.1f}s")
+    val_user_vectors, val_item_vectors, val_model = train_both(
+        validation, args, device, "val")
 
-    t = time.time()
-    user_vectors, item_vectors = train_lightgcn(
-        interactions, epochs=args.lightgcn_epochs, dimension=args.dimension,
-        n_layers=args.layers, device=device, verbose=False)
-    print(f"  LightGCN in {time.time() - t:.0f}s")
+    print("\nSweeping beta on validation ...")
+    candidates, values = retrieve(
+        val_user_vectors, val_item_vectors, val_users, val_histories,
+        k=args.candidates, device=device)
 
-    print("\nTraining BERT4Rec ...")
-    sequences = training_sequences(interactions, args.max_length)
-    print(f"  {len(sequences):,} training sequences")
-    t = time.time()
-    model = train_bert4rec(
-        sequences, interactions.n_items, epochs=args.bert_epochs,
-        max_length=args.max_length, device=device, verbose=False)
-    print(f"  BERT4Rec in {time.time() - t:.0f}s")
-
-    popular = popularity(interactions)
-    cold = ContentRecommender(
-        build_content_matrix(interactions, encoder=args.encoder), popular)
-
-    popularity_model = PopularityRecommender(popular)
-    graph_model = GraphRecommender(
-        interactions, user_vectors, item_vectors, popularity_model)
-    sequential_model = SequentialRecommender(model, args.max_length, device)
-
-    # ----------------------------------------------------------- validation
-    print("\nFitting the blends on validation ...")
-    print("  refitting the retrieval models without the validation targets")
-    val_ease = RecencyEASE(validation, l2=args.l2, half_life=args.half_life)
-    val_popular = popularity(validation)
-    val_cold = ContentRecommender(
-        build_content_matrix(validation, encoder=args.encoder), val_popular)
-
-    blend = RetrievalBlend(val_ease, val_cold, n_candidates=args.candidates)
-    best_alpha, alpha_sweep = fit_alpha_on_retrieval(blend, validation_pairs)
-    print(f"  alpha = {best_alpha}")
-
-    print("  a second BERT4Rec, for the rerank weight")
-    val_model = train_bert4rec(
-        training_sequences(validation, args.max_length), validation.n_items,
-        epochs=args.bert_epochs, max_length=args.max_length, device=device,
-        verbose=False)
-    val_two_stage = TwoStageRecommender(
-        val_ease, val_cold, val_model, alpha=best_alpha,
-        n_candidates=args.candidates, max_length=args.max_length, device=device)
-    best_beta, beta_sweep = fit_beta(val_two_stage, validation_pairs, k=args.k)
+    beta_sweep = {}
+    for beta in (0.0, 0.25, 0.5, 0.75, 1.0):
+        ranked = rerank(val_model, val_histories, candidates, values,
+                        beta=beta, max_length=args.max_length, device=device)
+        result, _ = score_ranked(ranked, val_targets, k=args.k)
+        beta_sweep[beta] = result[recall_key]
+        print(f"  beta={beta:.2f}  recall@{args.k}={beta_sweep[beta]:.4f}")
+    best_beta = max(beta_sweep, key=beta_sweep.get)
     print(f"  beta = {best_beta}")
 
-    # ----------------------------------------------------------------- test
-    two_stage = TwoStageRecommender(
-        ease, cold, model, alpha=best_alpha, beta=best_beta,
-        n_candidates=args.candidates, max_length=args.max_length, device=device)
+    del val_user_vectors, val_item_vectors, val_model, candidates, values
+    if device != "cpu":
+        torch.cuda.empty_cache()
 
-    pairs = interactions.evaluation_pairs()
-    print(f"\nEvaluating on {len(pairs):,} held-out users ...\n")
+    # --------------------------------------------------------------- test
+    users, histories, targets = evaluation_sample(
+        interactions, args.eval_users, seed=0)
+    print(f"\nTest: {len(users):,} users")
 
-    systems = {
-        "popularity": popularity_model,
-        "bert4rec": sequential_model,
-        "lightgcn": graph_model,
-        "ease": ease,
-        "two_stage": two_stage,
-    }
+    user_vectors, item_vectors, model = train_both(
+        interactions, args, device, "test")
 
+    popular = popularity(interactions, top=max(500, args.candidates))
     results, outcomes = {}, {}
-    for name, system in systems.items():
-        results[name] = evaluate(
-            system, pairs, k=args.k, catalogue_size=interactions.n_items - 1)
-        outcomes[name] = hits(system, pairs, k=args.k)
-        print(
-            f"  {name:<12} recall@{args.k} {results[name][f'recall@{args.k}']:.4f}"
-            f"   ndcg@{args.k} {results[name][f'ndcg@{args.k}']:.4f}"
-            f"   coverage {results[name]['catalogue_coverage']:.1%}"
-        )
 
+    def record(name, ranked):
+        result, hits = score_ranked(ranked, targets, k=args.k,
+                                    catalogue_size=n_items)
+        results[name], outcomes[name] = result, hits
+        print(f"  {name:<12} recall@{args.k} {result[recall_key]:.4f}"
+              f"   ndcg@{args.k} {result[ndcg_key]:.4f}"
+              f"   coverage {result['catalogue_coverage']:.2%}")
+
+    print("\nEvaluating ...")
+    record("popularity", popularity_ranked(popular, histories, k=args.k))
+    record("bert4rec", sequential_topk(
+        model, histories, k=args.k, max_length=args.max_length, device=device))
+
+    lightgcn_only, _ = retrieve(user_vectors, item_vectors, users, histories,
+                                k=args.k, device=device)
+    record("lightgcn", lightgcn_only)
+
+    candidates, values = retrieve(
+        user_vectors, item_vectors, users, histories, k=args.candidates,
+        device=device)
+    record("two_stage", rerank(model, histories, candidates, values,
+                               beta=best_beta, max_length=args.max_length,
+                               device=device))
+
+    # ---------------------------------------------------------- intervals
     print("\nPaired against popularity, 2000 bootstrap resamples:")
     comparisons = {}
-    for name in systems:
+    for name in results:
         if name == "popularity":
             continue
-        comparison = bootstrap_difference(outcomes[name], outcomes["popularity"])
+        comparison = bootstrap_difference(outcomes[name],
+                                          outcomes["popularity"])
         comparisons[f"{name}_vs_popularity"] = comparison
         flag = "" if comparison["ci_low"] > 0 else "   (interval spans zero)"
         print(f"  {name:<12} {comparison['difference']:+.4f} "
-              f"[{comparison['ci_low']:+.4f}, {comparison['ci_high']:+.4f}]{flag}")
+              f"[{comparison['ci_low']:+.4f}, "
+              f"{comparison['ci_high']:+.4f}]{flag}")
 
-    for a, b in (("two_stage", "ease"), ("ease", "lightgcn")):
-        comparison = bootstrap_difference(outcomes[a], outcomes[b])
-        comparisons[f"{a}_vs_{b}"] = comparison
-        print(f"\n  {a} minus {b}: {comparison['difference']:+.4f} "
-              f"[{comparison['ci_low']:+.4f}, {comparison['ci_high']:+.4f}]")
+    for a, b in (("two_stage", "lightgcn"), ("two_stage", "bert4rec")):
+        if a in outcomes and b in outcomes:
+            comparison = bootstrap_difference(outcomes[a], outcomes[b])
+            comparisons[f"{a}_vs_{b}"] = comparison
+            print(f"\n  {a} minus {b}: {comparison['difference']:+.4f} "
+                  f"[{comparison['ci_low']:+.4f}, "
+                  f"{comparison['ci_high']:+.4f}]")
 
     summary = {
-        "dataset": interactions.summary(),
+        "dataset": {"category": args.category, **interactions.summary()},
         "k": args.k,
         "settings": {
-            "encoder": args.encoder, "l2": args.l2,
-            "half_life": args.half_life, "dimension": args.dimension,
-            "layers": args.layers, "lightgcn_epochs": args.lightgcn_epochs,
-            "bert_epochs": args.bert_epochs, "candidates": args.candidates,
+            "dimension": args.dimension, "layers": args.layers,
+            "lightgcn_epochs": args.lightgcn_epochs,
+            "lightgcn_batch": args.lightgcn_batch,
+            "bert_epochs": args.bert_epochs, "bert_batch": args.bert_batch,
+            "negatives": args.negatives, "candidates": args.candidates,
+            "eval_users": len(users), "device": device,
         },
-        "alpha": best_alpha,
-        "alpha_sweep": {str(a): v for a, v in alpha_sweep.items()},
         "beta": best_beta,
         "beta_sweep": {str(b): v for b, v in beta_sweep.items()},
         "results": results,
@@ -188,11 +203,16 @@ def main():
         "seconds": round(time.time() - started, 1),
     }
 
-    out = Path(args.out)
+    out = Path(args.out or ROOT / "docs" / f"amazon_{args.category}.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    figure = results_figure(summary, out.parent / "results.png")
-    print(f"\nWrote {out} and {figure} in {time.time() - started:.0f}s")
+    print(f"\nWrote {out} in {time.time() - started:.0f}s")
+
+    figure = figure_from_docs(out.parent, out.parent / "results.png")
+    if figure:
+        print(f"Redrew {figure} from both categories.")
+    else:
+        print("Run the other category too and this will redraw the figure.")
 
 
 if __name__ == "__main__":

@@ -1,14 +1,20 @@
-"""The results figure.
+"""The results figure: both catalogues, and the weight that was fitted twice.
 
-One style block so the two panels read as one set. Categorical hues assigned
-in fixed order and never cycled, one hue light to dark for magnitude, recessive
-grid and axes, direct labels where a number is worth reading off, and a legend
-whenever two series share a panel.
+Three panels. The first two are the same four systems on the two Amazon
+categories, drawn on their own axes because the problems are not the same
+difficulty: a hit at rank ten out of 25,612 items and a hit out of 162,035 are
+different events, and putting them on a shared axis would only say that the
+larger catalogue is harder, which is not news.
 
-The figure is a PNG for the README rather than an interactive page, so there is
-no hover to fall back on. That is why every panel carries its own labels: the
-numbers have to be on the image.
+The third is the panel with a finding in it. beta is how much of the final
+order the sequence model sets, fitted separately on each category against
+models that never saw a test target. It came out at 0.75 both times, and both
+curves fall again at 1.0: the reranker is worth most of the order and not all
+of it.
 """
+import json
+from pathlib import Path
+
 import matplotlib
 
 matplotlib.use("Agg")
@@ -23,16 +29,16 @@ GRID = "#e1e0d9"
 BASELINE = "#c3c2b7"
 
 SERIES_1 = "#2a78d6"
+SERIES_2 = "#eb6834"
 SEQUENTIAL = ["#9ec5f4", "#6da7ec", "#3987e5", "#2a78d6", "#256abf", "#1c5cab"]
 
 LABELS = {
     "popularity": "Most popular",
     "bert4rec": "BERT4Rec alone",
     "lightgcn": "LightGCN alone",
-    "ease": "Recency EASE",
     "two_stage": "Two-stage",
 }
-ORDER = ["popularity", "bert4rec", "lightgcn", "ease", "two_stage"]
+ORDER = ["popularity", "bert4rec", "lightgcn", "two_stage"]
 
 
 def apply_style():
@@ -67,78 +73,94 @@ def _strip(ax, keep=("left", "bottom")):
         spine.set_visible(side in keep)
 
 
-def panel_recall(ax, results, k):
+def panel_recall(ax, summary, k):
     """Recall@k for each system. Bars from zero, so lengths are comparable."""
+    results = summary["results"]
     values = [results[name][f"recall@{k}"] for name in ORDER]
-    colours = [BASELINE] + list(SEQUENTIAL[1:5])
+    colours = [BASELINE, SEQUENTIAL[1], SEQUENTIAL[1], SERIES_1]
     y = np.arange(len(ORDER))
 
     ax.barh(y, values, height=0.6, color=colours, zorder=2)
     for yi, value in zip(y, values):
-        ax.annotate(f"{value:.3f}", (value, yi), textcoords="offset points",
+        ax.annotate(f"{value:.4f}", (value, yi), textcoords="offset points",
                     xytext=(6, 0), va="center", fontsize=9, color=INK,
                     fontweight="bold")
 
+    dataset = summary["dataset"]
     ax.set_yticks(y)
     ax.set_yticklabels([LABELS[name] for name in ORDER])
-    ax.set_xlim(0, max(values) * 1.3)
-    ax.set_xlabel(f"Recall@{k}, 943 held-out users")
-    ax.set_title("Each stage earns its place")
+    ax.set_xlim(0, max(values) * 1.32)
+    ax.set_xlabel(f"Recall@{k}, {dataset['items_in_catalogue']:,} items")
+    ax.set_title(dataset["category"].replace("_", " "))
     ax.grid(axis="y", visible=False)
     _strip(ax)
 
 
-def panel_coverage(ax, results, k):
-    """Recall against catalogue coverage, which is the popularity trap.
+def panel_beta(ax, summaries, k):
+    """How much of the final order the reranker should set, on each category."""
+    colours = (SERIES_1, SERIES_2)
+    for summary, colour in zip(summaries, colours):
+        sweep = summary["beta_sweep"]
+        betas = sorted(float(b) for b in sweep)
+        # Each category is drawn against its own best, so two problems of very
+        # different difficulty can share one axis and still be compared.
+        values = [sweep[str(b)] for b in betas]
+        best = max(values)
+        share = [v / best for v in values]
 
-    A recommender that returns the same sixty items to everybody scores
-    respectably on recall. Plotting the share of the catalogue it reaches is
-    what makes that visible.
-    """
-    # Two-stage and EASE sit almost on top of each other, so the labels
-    # alternate above and below rather than collide.
-    offsets = {"popularity": (12, -3, "left"), "bert4rec": (-12, -3, "right"),
-               "lightgcn": (0, -18, "center"), "ease": (13, -4, "left"),
-               "two_stage": (0, 14, "center")}
-    for name in ORDER:
-        x = results[name]["catalogue_coverage"]
-        y = results[name][f"recall@{k}"]
-        colour = BASELINE if name == "popularity" else SERIES_1
-        ax.scatter([x], [y], s=110, color=colour, zorder=3,
-                   edgecolor=SURFACE, linewidth=2)
-        dx, dy, align = offsets.get(name, (0, 14, "center"))
-        ax.annotate(LABELS[name], (x, y), textcoords="offset points",
-                    xytext=(dx, dy), ha=align, fontsize=8.5,
-                    color=INK_SECONDARY)
+        label = summary["dataset"]["category"].replace("_", " ")
+        ax.plot(betas, share, color=colour, linewidth=2, zorder=3, label=label)
+        ax.scatter(betas, share, s=34, color=colour, zorder=4,
+                   edgecolor=SURFACE, linewidth=1.5)
 
-    ax.set_xlim(0, 0.78)
-    ax.set_ylim(-0.012, max(results[n][f"recall@{k}"] for n in ORDER) * 1.4)
-    ax.xaxis.set_major_formatter(lambda v, _: f"{v:.0%}")
-    ax.set_xlabel("Share of the catalogue ever recommended")
-    ax.set_ylabel(f"Recall@{k}")
-    ax.set_title("Popularity reaches 5% of the catalogue")
+    ax.axvline(0.75, color=BASELINE, linewidth=1.2, linestyle=(0, (3, 3)),
+               zorder=1)
+    ax.annotate("both fitted to 0.75", (0.75, 1.035),
+                ha="center", fontsize=8.5, color=INK, fontweight="bold")
+
+    ax.set_xticks([0.0, 0.25, 0.5, 0.75, 1.0])
+    ax.set_ylim(0.55, 1.09)
+    ax.yaxis.set_major_formatter(lambda v, _: f"{v:.0%}")
+    ax.set_xlabel("beta: how much of the order the reranker sets")
+    ax.set_ylabel(f"Recall@{k}, against each category's best")
+    ax.set_title("Reranking helps only if it keeps the retrieval score")
+    ax.legend(loc="lower right")
+    ax.grid(axis="x", visible=False)
     _strip(ax)
 
 
-def results_figure(summary, path):
+def results_figure(summaries, path):
+    """`summaries` is the list of run summaries, smaller catalogue first."""
     apply_style()
-    figure, axes = plt.subplots(1, 2, figsize=(12.5, 4.3))
-    k = summary["k"]
+    summaries = sorted(summaries,
+                       key=lambda s: s["dataset"]["items_in_catalogue"])
+    k = summaries[0]["k"]
 
-    panel_recall(axes[0], summary["results"], k)
-    panel_coverage(axes[1], summary["results"], k)
+    figure, axes = plt.subplots(1, 3, figsize=(13.0, 4.1))
+    panel_recall(axes[0], summaries[0], k)
+    panel_recall(axes[1], summaries[1], k)
+    panel_beta(axes[2], summaries, k)
 
     figure.suptitle(
-        "Two-stage recommendation, measured against what is free",
-        fontsize=13, fontweight="bold", color=INK, x=0.012, ha="left", y=0.99,
-    )
+        "LightGCN retrieval, BERT4Rec reranking, on two Amazon catalogues",
+        fontsize=13, fontweight="bold", color=INK, x=0.008, ha="left", y=0.98)
     figure.text(
-        0.012, 0.912,
-        "MovieLens 100k, leave-one-out: the last film of each user is the "
-        "target and everything before it trains. 943 users, 1,682 films.",
-        fontsize=8.5, color=INK_MUTED, ha="left",
-    )
-    figure.tight_layout(rect=[0, 0, 1, 0.9])
+        0.008, 0.915,
+        "Amazon Reviews 2023, 5-core, leave-one-out: the last item of each "
+        "user is the target and everything before it trains. 20,000 held-out "
+        "users per category, every weight fitted on a split one step further "
+        "back.",
+        fontsize=8.5, color=INK_MUTED, ha="left")
+    figure.tight_layout(rect=[0, 0, 1, 0.88])
     figure.savefig(path, dpi=150)
     plt.close(figure)
     return path
+
+
+def figure_from_docs(docs_dir, path):
+    """Draw from whatever `amazon_*.json` files a run has left behind."""
+    summaries = [json.loads(p.read_text(encoding="utf-8"))
+                 for p in sorted(Path(docs_dir).glob("amazon_*.json"))]
+    if len(summaries) < 2:
+        return None
+    return results_figure(summaries, path)
