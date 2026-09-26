@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.DS_Store
+data/
+
+# docs/results.json and docs/results.png are committed: the README shows
+# the figure, and the figure is drawn from the file.
+logs/

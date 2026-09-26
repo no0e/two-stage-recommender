@@ -1,0 +1,122 @@
+{
+  "dataset": {
+    "category": "Video_Games",
+    "protocol": "leave_one_out",
+    "events": 814586,
+    "users": 94762,
+    "items_in_catalogue": 25612,
+    "train_events": 719824,
+    "test_events": 94762,
+    "cold_start_users": 0
+  },
+  "k": 10,
+  "settings": {
+    "dimension": 64,
+    "layers": 3,
+    "lightgcn_epochs": 400,
+    "lightgcn_batch": 500000,
+    "bert_epochs": 10,
+    "bert_batch": 1024,
+    "negatives": 2048,
+    "candidates": 100,
+    "eval_users": 20000,
+    "device": "cuda"
+  },
+  "ease": {
+    "gram_bytes": 5247796352,
+    "needed_bytes": 10495592704,
+    "gram_gib": 4.887391209602356,
+    "needed_gib": 9.774782419204712,
+    "note": "fitted in 197s"
+  },
+  "beta": 0.75,
+  "beta_sweep": {
+    "0.0": 0.07745,
+    "0.25": 0.0825,
+    "0.5": 0.0902,
+    "0.75": 0.0974,
+    "1.0": 0.08735
+  },
+  "results": {
+    "popularity": {
+      "recall@10": 0.024,
+      "ndcg@10": 0.012035042774902117,
+      "evaluated": 20000,
+      "distinct_items_recommended": 19,
+      "catalogue_coverage": 0.000741839762611276
+    },
+    "bert4rec": {
+      "recall@10": 0.0683,
+      "ndcg@10": 0.037947899694548565,
+      "evaluated": 20000,
+      "distinct_items_recommended": 20371,
+      "catalogue_coverage": 0.7953693581133844
+    },
+    "lightgcn": {
+      "recall@10": 0.06675,
+      "ndcg@10": 0.035972340020037186,
+      "evaluated": 20000,
+      "distinct_items_recommended": 8370,
+      "catalogue_coverage": 0.32679993752928316
+    },
+    "two_stage": {
+      "recall@10": 0.086,
+      "ndcg@10": 0.04808744851218185,
+      "evaluated": 20000,
+      "distinct_items_recommended": 8231,
+      "catalogue_coverage": 0.32137279400281116
+    },
+    "ease": {
+      "recall@10": 0.0893,
+      "ndcg@10": 0.051114842779768875,
+      "evaluated": 20000,
+      "distinct_items_recommended": 8604,
+      "catalogue_coverage": 0.33593627986881147
+    }
+  },
+  "comparisons": {
+    "bert4rec_vs_popularity": {
+      "difference": 0.0443,
+      "ci_low": 0.0406,
+      "ci_high": 0.04795,
+      "n": 20000
+    },
+    "lightgcn_vs_popularity": {
+      "difference": 0.04275,
+      "ci_low": 0.0392,
+      "ci_high": 0.0464,
+      "n": 20000
+    },
+    "two_stage_vs_popularity": {
+      "difference": 0.062,
+      "ci_low": 0.058,
+      "ci_high": 0.06585,
+      "n": 20000
+    },
+    "ease_vs_popularity": {
+      "difference": 0.0653,
+      "ci_low": 0.0613,
+      "ci_high": 0.06935,
+      "n": 20000
+    },
+    "two_stage_vs_lightgcn": {
+      "difference": 0.01925,
+      "ci_low": 0.01605,
+      "ci_high": 0.0223,
+      "n": 20000
+    },
+    "two_stage_vs_bert4rec": {
+      "difference": 0.0177,
+      "ci_low": 0.0146,
+      "ci_high": 0.020801249999999993,
+      "n": 20000
+    },
+    "lightgcn_vs_ease": {
+      "difference": -0.02255,
+      "ci_low": -0.02615125,
+      "ci_high": -0.0191,
+      "n": 20000
+    }
+  },
+  "seconds": 3945.1
+}
