@@ -45,36 +45,9 @@ underneath. `--user` picks another one, `--rerank` adds the second stage.
 
 ## What it does
 
-```mermaid
-flowchart LR
-    H[/"a user, and their history"/]
-
-    subgraph RET["«stage 1» retrieval · whole catalogue · cheap"]
-        direction TB
-        E["RecencyEASE<br/>closed form, half-life 20"]
-        G["LightGCN<br/>sparse propagation, no graph library"]
-        C["ContentRecommender<br/>TF-IDF, cold start"]
-        B["blend<br/>α·model + (1−α)·content"]
-        E --> B
-        G --> B
-        C --> B
-    end
-
-    subgraph RER["«stage 2» reranking · 100 items · expensive"]
-        direction TB
-        S["BERT4Rec<br/>left-padded, candidate-only logits"]
-        M["blend<br/>β·sequence + (1−β)·retrieval"]
-        S --> M
-    end
-
-    H --> E
-    H --> G
-    H --> C
-    B --> CAND["top 100 candidates<br/>and the scores that retrieved them"]
-    CAND --> S
-    CAND -. "the retrieval score is kept,<br/>not thrown away" .-> M
-    M --> TOP(["top 10"])
-```
+<p align="center">
+  <img src="docs/pipeline.svg" width="100%" alt="Two stages, left to right: retrieval over the whole catalogue with EASE, LightGCN and a content model blended by alpha, giving a hundred candidates; then BERT4Rec reranking, blended with the retrieval score by beta, giving the top ten">
+</p>
 
 α and β are fitted on a split taken one step further back, with models that
 never saw a test target. On MovieLens α came out at 1.0 — the content model
