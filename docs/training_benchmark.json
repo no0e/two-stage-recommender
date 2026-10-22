@@ -1,0 +1,72 @@
+{
+  "device": "Tesla T4",
+  "torch": "2.14.1+cu132",
+  "items": 162036,
+  "batch": 1024,
+  "negatives": 2048,
+  "max_length": 50,
+  "steps": 100,
+  "warmup": 15,
+  "results": [
+    {
+      "precision": "fp32",
+      "compiled": false,
+      "samples_per_sec": 8236.8,
+      "step_ms": 124.32,
+      "peak_memory_mib": 3569,
+      "final_loss_finite": true,
+      "speedup_vs_fp32": 1.0,
+      "memory_saved_vs_fp32": 0.0
+    },
+    {
+      "precision": "fp16",
+      "compiled": false,
+      "samples_per_sec": 10429.0,
+      "step_ms": 98.19,
+      "peak_memory_mib": 2846,
+      "final_loss_finite": true,
+      "speedup_vs_fp32": 1.27,
+      "memory_saved_vs_fp32": 0.203
+    },
+    {
+      "precision": "bf16",
+      "compiled": false,
+      "samples_per_sec": 6113.1,
+      "step_ms": 167.51,
+      "peak_memory_mib": 3075,
+      "final_loss_finite": true,
+      "speedup_vs_fp32": 0.74,
+      "memory_saved_vs_fp32": 0.138
+    },
+    {
+      "precision": "fp32",
+      "compiled": true,
+      "samples_per_sec": 10343.7,
+      "step_ms": 99.0,
+      "peak_memory_mib": 2686,
+      "final_loss_finite": true,
+      "speedup_vs_fp32": 1.26,
+      "memory_saved_vs_fp32": 0.247
+    },
+    {
+      "precision": "fp16",
+      "compiled": true,
+      "samples_per_sec": 16678.5,
+      "step_ms": 61.4,
+      "peak_memory_mib": 1784,
+      "final_loss_finite": true,
+      "speedup_vs_fp32": 2.02,
+      "memory_saved_vs_fp32": 0.5
+    },
+    {
+      "precision": "bf16",
+      "compiled": true,
+      "samples_per_sec": 6085.0,
+      "step_ms": 168.28,
+      "peak_memory_mib": 3067,
+      "final_loss_finite": true,
+      "speedup_vs_fp32": 0.74,
+      "memory_saved_vs_fp32": 0.141
+    }
+  ]
+}
