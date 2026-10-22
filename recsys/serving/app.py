@@ -7,7 +7,13 @@ Environment:
     ARTIFACTS_DIR   exported artifacts (see recsys/serving/__init__.py)
     REDIS_URL       if set, user features come from Redis; else from memory
     RERANKER        reranker.int8.onnx (default) or reranker.onnx
-    ORT_THREADS     intra-op threads for ONNX Runtime (default: runtime's)
+    ORT_THREADS     intra-op threads per worker for ONNX Runtime (default 1)
+
+Scale with uvicorn workers, not threads. One request is a 50-step sequence
+and 100 candidates, far too small to parallelise inside; ONNX Runtime's
+default of one thread per core, times several workers, oversubscribes the
+machine. Measured on 72 cores: 9.6 req/s with the default, 2,276 with one
+thread per worker and 8 workers.
 
 The handler is async so a slow Redis call never blocks the event loop. The
 ONNX call is CPU-bound and synchronous, so it runs in the thread pool, where
@@ -115,7 +121,7 @@ def create_app(directory=None, store=None, reranker_file=None, threads=None):
         app.state.recommender = Recommender(
             directory, store or build_store(directory),
             reranker_file or os.environ.get("RERANKER"),
-            threads or int(os.environ.get("ORT_THREADS", "0")) or None)
+            threads or int(os.environ.get("ORT_THREADS", "1")))
         yield
         await app.state.recommender.store.close()
 
