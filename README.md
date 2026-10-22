@@ -76,6 +76,47 @@ and Games about four. Both write `docs/amazon_<category>.json`, and the second
 run redraws the figure from the pair. `scripts/overnight.sh` runs them in
 order.
 
+## Serving
+
+The two stages behind an HTTP endpoint, with no PyTorch in the serving image.
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+python scripts/export_serving.py --category Toys_and_Games --precision fp16 --compile
+CATEGORY=Toys_and_Games docker compose up --build          # API + Redis + loader
+locust -f loadtest/locustfile.py --host http://localhost:8000
+```
+
+`export_serving.py` trains both stages and writes the reranker's candidate-scoring path as an ONNX graph, then checks it against PyTorch on 200 real users before anything is served: the fp32 graph agrees to 8·10⁻⁶ and gives the same top 10 for every one of them. An int8 copy (weights of MatMul and Gather quantized) is written too, and rejected: it keeps the top 10 for only 66% of users on Toys and Games, so the service picks the fp32 graph on its own, from the parity it recorded.
+
+`recsys/serving/app.py` is an async FastAPI service. A request reads the user's history and embedding from Redis in one pipelined round trip (or from memory, where there is no Redis), retrieves 100 candidates with a numpy dot product over the item table, scores them with ONNX Runtime in the thread pool and blends the two scores with the fitted beta. Users the graph never saw get the popularity fallback.
+
+Load test with Locust, 64 concurrent users, on one 72-core machine ([docs/serving_benchmark.json](docs/serving_benchmark.json)):
+
+| Catalogue | Workers | Requests/s | p50 | p99 | Failures |
+|---|---|---|---|---|---|
+| Toys and Games, 162,036 items | 8 | 959 | 61 ms | 140 ms | 0 of 114,272 |
+| Toys and Games | 16 | 1,033 | 47 ms | 170 ms | 0 |
+| Video Games, 25,612 items | 8 | 2,276 | 25 ms | 48 ms | 0 |
+
+One ONNX Runtime thread per worker is what makes those numbers. The runtime's default of a thread per core, times four workers, oversubscribed the machine: 9.6 requests per second and a 13 s p99 on the small catalogue.
+
+`deploy/cloudrun.sh` builds the image with Cloud Build and deploys it to Cloud Run with the artifacts baked in.
+
+## Training efficiency
+
+The reranker's training step runs under fp16 autocast with a gradient scaler and `torch.compile`, measured by `scripts/benchmark_training.py` at the size of Toys and Games (162,036 items, batch 1,024, 2,048 sampled negatives) on a Tesla T4 ([docs/training_benchmark.json](docs/training_benchmark.json)):
+
+| | samples/s | step | peak memory |
+|---|---|---|---|
+| fp32 | 8,237 | 124 ms | 3,569 MiB |
+| fp16 | 10,429 | 98 ms | 2,846 MiB |
+| fp32 + compile | 10,344 | 99 ms | 2,686 MiB |
+| **fp16 + compile** | **16,679** | **61 ms** | **1,784 MiB** |
+| bf16 + compile | 6,085 | 168 ms | 3,067 MiB |
+
+Twice the throughput at half the memory. bf16 is slower than fp32 here because a T4 has no bf16 tensor cores; on an Ampere card it is the one to pick.
+
 ## Layout
 
 ```
@@ -84,8 +125,11 @@ recsys/amazon.py     the categories, and prefixes held as offsets
 recsys/models.py     LightGCN and BERT4Rec
 recsys/large.py      blocked retrieval, candidate-only reranking
 recsys/metrics.py    recall, NDCG, coverage, paired bootstrap
-scripts/             recommend, evaluate, overnight
-tests/               24 tests, no download and no GPU needed
+recsys/serving/      ONNX export, numpy + ONNX Runtime ranking, Redis store, FastAPI
+scripts/             recommend, evaluate, export_serving, benchmark_training, ...
+loadtest/            the Locust scenario
+deploy/              Cloud Run (Cloud Build + gcloud run deploy)
+tests/               39 tests, no download and no GPU needed
 notebooks/           the competition notebook, as it was run
 ```
 
