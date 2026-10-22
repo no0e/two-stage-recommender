@@ -22,16 +22,26 @@ sys.path.insert(0, str(ROOT))
 import torch  # noqa: E402
 
 from recsys.amazon import (  # noqa: E402
-    CATEGORIES, FlatSequences, evaluation_sample, load_amazon,
+    CATEGORIES,
+    FlatSequences,
+    evaluation_sample,
+    load_amazon,
 )
 from recsys.large import (  # noqa: E402
-    popularity_ranked, rerank, retrieve, score_ranked, sequential_topk,
+    popularity_ranked,
+    rerank,
+    retrieve,
+    score_ranked,
+    sequential_topk,
 )
 from recsys.metrics import bootstrap_difference  # noqa: E402
-from recsys.plotting import figure_from_docs  # noqa: E402
 from recsys.models import (  # noqa: E402
-    WindowDataset, popularity, train_bert4rec, train_lightgcn,
+    WindowDataset,
+    popularity,
+    train_bert4rec,
+    train_lightgcn,
 )
+from recsys.plotting import figure_from_docs  # noqa: E402
 
 
 def parse():

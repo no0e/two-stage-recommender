@@ -9,3 +9,9 @@ data/
 # docs/results.json and docs/results.png are committed: the README shows
 # the figure, and the figure is drawn from the file.
 logs/
+
+# Exported serving artifacts are rebuilt by scripts/export_serving.py.
+serving_artifacts/*
+!serving_artifacts/.gitkeep
+# Locust raw output; the summary is docs/serving_benchmark.json.
+docs/locust_*.csv

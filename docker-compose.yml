@@ -1,0 +1,28 @@
+# API + Redis feature store + a one-shot loader, on one machine.
+#
+#   CATEGORY=Video_Games docker compose up --build
+#   locust -f loadtest/locustfile.py --host http://localhost:8000
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports: ["6379:6379"]
+
+  loader:
+    build: .
+    depends_on: [redis]
+    volumes: ["./serving_artifacts/${CATEGORY:-Video_Games}:/app/artifacts:ro",
+              "./scripts:/app/scripts:ro"]
+    command: ["python", "scripts/fill_redis.py", "/app/artifacts",
+              "--url", "redis://redis:6379/0"]
+    restart: "no"
+
+  api:
+    build: .
+    depends_on:
+      loader: {condition: service_completed_successfully}
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      WORKERS: "4"
+    volumes: ["./serving_artifacts/${CATEGORY:-Video_Games}:/app/artifacts:ro"]
+    ports: ["8000:8000"]

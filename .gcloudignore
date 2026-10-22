@@ -1,0 +1,10 @@
+# Cloud Build uploads this context. Unlike .gitignore, the exported
+# serving artifacts are kept: the image bakes them in.
+.git
+data/
+logs/
+notebooks/
+docs/
+**/__pycache__
+.pytest_cache
+.ruff_cache
