@@ -238,7 +238,10 @@ class BERT4Rec(nn.Module):
             d_model=dimension, nhead=n_heads, dim_feedforward=dimension * 4,
             dropout=dropout, activation="gelu", batch_first=True,
         )
-        self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
+        # No nested-tensor fast path: it is a prototype API, it changes
+        # nothing numerically, and it is what makes the ONNX trace warn.
+        self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers,
+                                             enable_nested_tensor=False)
         self.output = nn.Linear(dimension, n_items)
 
     def forward(self, sequences, candidates=None):
