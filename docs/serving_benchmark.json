@@ -1,0 +1,21 @@
+{
+  "note": "Toys_and_Games (162,036 items, 432,264 users), fp32 ONNX reranker over 100 retrieved candidates, Redis feature store, 8 uvicorn workers x 1 ORT thread, 64 concurrent Locust users on the same 72-core machine",
+  "requests": 114272,
+  "failures": 0,
+  "requests_per_sec": 958.7,
+  "latency_ms": {
+    "median": 61.0,
+    "p95": 120.0,
+    "p99": 140.0,
+    "max": 266.01094380021095
+  },
+  "also_measured": {
+    "Toys_and_Games, 16 workers": {"requests_per_sec": 1032.8, "p99_ms": 170.0, "failures": 0},
+    "Video_Games (25,612 items), 8 workers": {"requests_per_sec": 2276.0, "p99_ms": 48.0, "failures": 0},
+    "Video_Games, ONNX Runtime default threads, 4 workers": {"requests_per_sec": 9.6, "p99_ms": 13000.0, "failures": 0}
+  },
+  "export": {
+    "Toys_and_Games": {"fp32_max_abs_diff": 8.1e-06, "fp32_top10_agreement": 1.0, "int8_top10_agreement": 0.655, "fp32_mb": 160.5, "int8_mb": 40.2, "served": "reranker.onnx"},
+    "Video_Games": {"fp32_max_abs_diff": 4.6e-06, "fp32_top10_agreement": 1.0, "int8_top10_agreement": 0.745, "fp32_mb": 26.7, "int8_mb": 6.8, "served": "reranker.onnx"}
+  }
+}
