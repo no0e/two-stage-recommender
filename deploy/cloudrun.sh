@@ -32,7 +32,7 @@ gcloud builds submit --config deploy/cloudbuild.yaml \
 
 gcloud run deploy "${SERVICE}" --image "${IMAGE}" --region "${REGION}" \
   --cpu 2 --memory 2Gi --concurrency 40 --min-instances 0 --max-instances 3 \
-  --set-env-vars "WORKERS=2,ORT_THREADS=1" --allow-unauthenticated
+  --set-env-vars "WORKERS=2" --allow-unauthenticated
 
 URL="$(gcloud run services describe "${SERVICE}" --region "${REGION}" \
   --format 'value(status.url)')"

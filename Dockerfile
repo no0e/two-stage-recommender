@@ -7,8 +7,10 @@
 # (which is what deploy/cloudrun.sh does, since Cloud Run has no volume to mount).
 FROM python:3.12-slim
 
+# One compute thread per worker: requests are scaled out with WORKERS.
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
-    ARTIFACTS_DIR=/app/artifacts PORT=8000 WORKERS=1
+    ARTIFACTS_DIR=/app/artifacts PORT=8000 WORKERS=2 ORT_THREADS=1 \
+    OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
 
 WORKDIR /app
 COPY requirements-serving.txt .
