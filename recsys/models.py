@@ -260,8 +260,11 @@ class BERT4Rec(nn.Module):
         padding_mask = sequences == PAD
         # A row that is entirely padding would make softmax divide by zero, so
         # its last slot is unmasked. It contributes nothing either way, but a
-        # NaN here would poison the whole batch.
-        padding_mask[padding_mask.all(dim=1), -1] = False
+        # NaN here would poison the whole batch. Written without an in-place
+        # boolean index so the graph exports to ONNX as plain elementwise ops.
+        last_slot = (positions == length - 1).unsqueeze(0)
+        padding_mask = padding_mask & ~(padding_mask.all(dim=1, keepdim=True)
+                                        & last_slot)
 
         x = self.encoder(x, src_key_padding_mask=padding_mask)
 
@@ -278,10 +281,72 @@ class BERT4Rec(nn.Module):
         return scores.masked_fill(candidates == PAD, float("-inf"))
 
 
+PRECISIONS = {"fp32": None, "fp16": torch.float16, "bf16": torch.bfloat16}
+
+
+def make_train_step(model, optimiser, n_items, n_negatives=None,
+                    precision="fp32", compile_model=False):
+    """One optimiser step of the reranker, as a closure over its settings.
+
+    `precision` picks the autocast dtype. fp16 needs a gradient scaler, since
+    small gradients underflow to zero in half precision; bf16 has the range of
+    fp32 and does not. On a Turing card such as a T4, fp16 is the one with
+    tensor cores, and bf16 is emulated and slower than fp32.
+
+    `compile_model` wraps the forward in `torch.compile`. The loss and the
+    optimiser stay eager: the transformer is where the time goes, and the
+    first steps pay the compilation once.
+
+    Shared with `scripts/benchmark_training.py`, so the throughput it measures
+    is the throughput of the loop that trains the model.
+    """
+    if precision not in PRECISIONS:
+        raise ValueError(f"precision is one of {sorted(PRECISIONS)}")
+    device_type = next(model.parameters()).device.type
+    amp_dtype = PRECISIONS[precision]
+    scaler = torch.amp.GradScaler(
+        device_type, enabled=(precision == "fp16" and device_type == "cuda"))
+    forward = torch.compile(model) if compile_model else model
+    criterion = nn.CrossEntropyLoss(ignore_index=PAD)
+    # The sampled loss needs its own criterion. Its label is always column 0,
+    # the position the target is placed at, and PAD is also 0: the shared
+    # criterion would call every single row an ignored one and average over an
+    # empty set, which is a NaN loss and a model of NaN weights.
+    sampled_criterion = nn.CrossEntropyLoss()
+
+    def step(batch_sequences, targets):
+        with torch.autocast(device_type, dtype=amp_dtype or torch.float32,
+                            enabled=amp_dtype is not None):
+            if n_negatives:
+                negatives = torch.randint(
+                    1, n_items, (len(targets), n_negatives),
+                    device=targets.device)
+                candidates = torch.cat([targets.unsqueeze(1), negatives], dim=1)
+                # The target is column 0 of every row, so the label is 0.
+                logits = forward(batch_sequences, candidates=candidates)
+                loss = sampled_criterion(
+                    logits.float(),
+                    torch.zeros(len(targets), dtype=torch.long,
+                                device=targets.device),
+                )
+            else:
+                loss = criterion(forward(batch_sequences).float(), targets)
+        if not torch.isfinite(loss):
+            return loss
+        optimiser.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        scaler.step(optimiser)
+        scaler.update()
+        return loss
+
+    return step
+
+
 def train_bert4rec(dataset, n_items, epochs=20, dimension=128, n_heads=4,
                    n_layers=2, max_length=50, batch_size=128,
                    learning_rate=1e-3, device="cpu", seed=0, verbose=True,
-                   n_negatives=None, workers=0):
+                   n_negatives=None, workers=0, precision="fp32",
+                   compile_model=False):
     """Fit the reranker.
 
     `n_negatives` turns the loss into a sampled softmax: the target is scored
@@ -294,21 +359,23 @@ def train_bert4rec(dataset, n_items, epochs=20, dimension=128, n_heads=4,
     Negatives are drawn uniformly and are not checked against the target. A
     collision makes one example unlearnable rather than wrong, and at this
     catalogue size it happens to about one row in eighty.
+
+    `precision` ("fp32", "fp16", "bf16") and `compile_model` are passed to
+    `make_train_step`; `scripts/benchmark_training.py` measures what they buy.
     """
     torch.manual_seed(seed)
     model = BERT4Rec(n_items, dimension, n_heads, n_layers, max_length).to(device)
     loader = DataLoader(
         dataset, batch_size=batch_size, shuffle=True, num_workers=workers,
         pin_memory=(workers > 0 and device != "cpu"),
+        # A compiled graph is specialised to a batch shape; a short last batch
+        # would trigger a second compilation for one step per epoch.
+        drop_last=compile_model and len(dataset) > batch_size,
     )
     optimiser = torch.optim.AdamW(
         model.parameters(), lr=learning_rate, weight_decay=0.01)
-    criterion = nn.CrossEntropyLoss(ignore_index=PAD)
-    # The sampled loss needs its own criterion. Its label is always column 0,
-    # the position the target is placed at, and PAD is also 0: the shared
-    # criterion would call every single row an ignored one and average over an
-    # empty set, which is a NaN loss and a model of NaN weights.
-    sampled_criterion = nn.CrossEntropyLoss()
+    step = make_train_step(model, optimiser, n_items, n_negatives=n_negatives,
+                           precision=precision, compile_model=compile_model)
 
     best, patience, since_best = float("inf"), 5, 0
     best_state = None
@@ -317,21 +384,10 @@ def train_bert4rec(dataset, n_items, epochs=20, dimension=128, n_heads=4,
         model.train()
         total = 0.0
         for batch_sequences, targets in loader:
-            batch_sequences = batch_sequences.to(device)
-            targets = targets.to(device)
+            batch_sequences = batch_sequences.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
 
-            if n_negatives:
-                negatives = torch.randint(
-                    1, n_items, (len(targets), n_negatives), device=device)
-                candidates = torch.cat(
-                    [targets.unsqueeze(1), negatives], dim=1)
-                # The target is column 0 of every row, so the label is 0.
-                loss = sampled_criterion(
-                    model(batch_sequences, candidates=candidates),
-                    torch.zeros(len(targets), dtype=torch.long, device=device),
-                )
-            else:
-                loss = criterion(model(batch_sequences), targets)
+            loss = step(batch_sequences, targets)
             if not torch.isfinite(loss):
                 raise RuntimeError(
                     "The reranker loss is not finite on the first steps of "
@@ -339,10 +395,6 @@ def train_bert4rec(dataset, n_items, epochs=20, dimension=128, n_heads=4,
                     "produce NaN weights, and a model of NaN weights still "
                     "returns a ranking, so this stops rather than reports one."
                 )
-
-            optimiser.zero_grad()
-            loss.backward()
-            optimiser.step()
             total += loss.item()
 
         average = total / len(loader)

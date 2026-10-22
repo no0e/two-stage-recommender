@@ -25,7 +25,9 @@ import torch  # noqa: E402
 from recsys.amazon import CATEGORIES, FlatSequences, load_amazon  # noqa: E402
 from recsys.large import rerank, retrieve  # noqa: E402
 from recsys.models import (  # noqa: E402
-    WindowDataset, train_bert4rec, train_lightgcn,
+    WindowDataset,
+    train_bert4rec,
+    train_lightgcn,
 )
 
 LINK = "https://www.amazon.com/dp/{}"

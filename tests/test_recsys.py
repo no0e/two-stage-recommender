@@ -22,7 +22,10 @@ from recsys.amazon import FlatSequences
 from recsys.data import PAD, Interactions
 from recsys.large import rerank, retrieve
 from recsys.models import (
-    BERT4Rec, WindowDataset, build_adjacency, train_bert4rec,
+    BERT4Rec,
+    WindowDataset,
+    build_adjacency,
+    train_bert4rec,
 )
 
 

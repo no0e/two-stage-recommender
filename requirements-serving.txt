@@ -1,0 +1,6 @@
+# What the API container installs: no torch, no GPU runtime.
+fastapi>=0.110
+uvicorn[standard]>=0.29
+onnxruntime>=1.17
+numpy>=1.24
+redis>=5.0

@@ -1,0 +1,13 @@
+line-length = 88
+target-version = "py310"
+extend-exclude = ["notebooks"]
+
+[lint]
+select = ["E", "F", "I", "B", "W"]
+# zip(strict=) adds noise to loops over arrays whose lengths are asserted.
+ignore = ["B905"]
+# Scripts put the repository root on sys.path before importing the package.
+per-file-ignores = { "scripts/*" = ["E402"] }
+
+[lint.isort]
+known-first-party = ["recsys"]
