@@ -35,6 +35,7 @@ def export_reranker(model, path, max_length, n_candidates=100, opset=18):
     model = model.eval().cpu()
     scorer = CandidateScorer(model).eval()
     sequences = torch.randint(1, model.n_items, (2, max_length))
+    sequences[0, :max_length // 2] = PAD  # trace a padded row, as served
     candidates = torch.randint(1, model.n_items, (2, n_candidates))
 
     # The legacy TorchScript exporter handles nn.TransformerEncoder and its
