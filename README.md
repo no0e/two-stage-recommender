@@ -76,32 +76,21 @@ and Games about four. Both write `docs/amazon_<category>.json`, and the second
 run redraws the figure from the pair. `scripts/overnight.sh` runs them in
 order.
 
-## Serving
+## Local serving prototype
 
-The two stages behind an HTTP endpoint, with no PyTorch in the serving image.
+A first step towards production, run locally: the reranker exported to ONNX and served behind a small FastAPI endpoint, with no PyTorch in the image.
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
-python scripts/export_serving.py --category Toys_and_Games --precision fp16 --compile
-CATEGORY=Toys_and_Games docker compose up --build          # API + Redis + loader
-locust -f loadtest/locustfile.py --host http://localhost:8000
+python scripts/export_serving.py --category Video_Games
+docker build -t recsys-api .
+docker run -p 8000:8000 -v $PWD/serving_artifacts/Video_Games:/app/artifacts recsys-api
+curl -X POST localhost:8000/recommend -H 'content-type: application/json' -d '{"user_id": 12, "k": 10}'
 ```
 
-`export_serving.py` trains both stages and writes the reranker's candidate-scoring path as an ONNX graph, then checks it against PyTorch on 200 real users before anything is served: the fp32 graph agrees to 8·10⁻⁶ and gives the same top 10 for every one of them. An int8 copy (weights of MatMul and Gather quantized) is written too, and rejected: it keeps the top 10 for only 66% of users on Toys and Games, so the service picks the fp32 graph on its own, from the parity it recorded.
+`export_serving.py` writes the reranker's candidate-scoring path as an ONNX graph and checks it against PyTorch on 200 real users before anything is served: the fp32 graph gives the same top 10 for all of them. An int8 copy is also written and rejected, since it keeps the same top 10 for only 66% of users.
 
-`recsys/serving/app.py` is an async FastAPI service. A request reads the user's history and embedding from Redis in one pipelined round trip (or from memory, where there is no Redis), retrieves 100 candidates with a numpy dot product over the item table, scores them with ONNX Runtime in the thread pool and blends the two scores with the fitted beta. Users the graph never saw get the popularity fallback.
-
-Load test with Locust, 64 concurrent users, on one 72-core machine ([docs/serving_benchmark.json](docs/serving_benchmark.json)):
-
-| Catalogue | Workers | Requests/s | p50 | p99 | Failures |
-|---|---|---|---|---|---|
-| Toys and Games, 162,036 items | 8 | 959 | 61 ms | 140 ms | 0 of 114,272 |
-| Toys and Games | 16 | 1,033 | 47 ms | 170 ms | 0 |
-| Video Games, 25,612 items | 8 | 2,276 | 25 ms | 48 ms | 0 |
-
-One ONNX Runtime thread per worker is what makes those numbers. The runtime's default of a thread per core, times four workers, oversubscribed the machine: 9.6 requests per second and a 13 s p99 on the small catalogue.
-
-`deploy/cloudrun.sh` builds the image with Cloud Build and deploys it to Cloud Run with the artifacts baked in.
+A request retrieves 100 candidates with a numpy dot product, scores them with ONNX Runtime and blends the two scores with the fitted beta; users the graph never saw get the most popular items. `loadtest/` holds a Locust scenario to check the endpoint under load. A Redis feature store and a Cloud Run script (`deploy/`) are in the repository as experiments; neither was deployed.
 
 ## Training efficiency
 
@@ -125,10 +114,10 @@ recsys/amazon.py     the categories, and prefixes held as offsets
 recsys/models.py     LightGCN and BERT4Rec
 recsys/large.py      blocked retrieval, candidate-only reranking
 recsys/metrics.py    recall, NDCG, coverage, paired bootstrap
-recsys/serving/      ONNX export, numpy + ONNX Runtime ranking, Redis store, FastAPI
+recsys/serving/      ONNX export, numpy + ONNX Runtime ranking, FastAPI
 scripts/             recommend, evaluate, export_serving, benchmark_training, ...
 loadtest/            the Locust scenario
-deploy/              Cloud Run (Cloud Build + gcloud run deploy)
+deploy/              Cloud Run script (experimental, not deployed)
 tests/               39 tests, no download and no GPU needed
 notebooks/           the competition notebook (modelling part)
 ```
